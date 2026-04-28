@@ -49,6 +49,56 @@ just test
 cargo test --all-features
 ```
 
+## Codex Desktop on Linux (`codex app`)
+
+`codex app` opens a workspace in Codex Desktop. macOS and Windows builds are
+shipped by OpenAI; OpenAI does not yet publish an official Linux build, so on
+Linux the command launches an **in-tree desktop wrapper that you build
+yourself** from this repository (no third-party redistribution required).
+
+When invoked on Linux, `codex app` looks for an installed launcher in the
+following locations and runs it with the workspace path as the first argument:
+
+| Path                                           | Source                          |
+| ---------------------------------------------- | ------------------------------- |
+| `codex-desktop` on `$PATH`                     | preferred — built from this repo|
+| `/usr/local/bin/codex-desktop`                 | system-wide install             |
+| `/usr/bin/codex-desktop`                       | distro packaging                |
+| `~/.local/bin/codex-desktop`                   | rootless install                |
+| `~/.cargo/bin/codex-desktop`                   | `cargo install` install         |
+| `~/Applications/Codex.AppImage` (and variants) | self-built AppImage drops       |
+| `~/.local/bin/Codex.AppImage`                  | self-built AppImage drops       |
+
+### Ubuntu 24.04+ quickstart
+
+1. Install the Codex CLI itself (`npm i -g @openai/codex` or download the
+   `codex-x86_64-unknown-linux-musl.tar.gz` release artifact).
+2. Build the in-tree desktop wrapper from source:
+   ```bash
+   git clone <this repo>
+   cd codex-rs
+   sudo apt install -y build-essential pkg-config libcap-dev curl
+   cargo build --release -p codex-desktop
+   install -Dm755 target/release/codex-desktop ~/.local/bin/codex-desktop
+   ```
+3. Run `codex app` from any project directory; it detects the binary in
+   `$PATH` and launches it on the workspace.
+
+If you have a self-built AppImage you trust, pass it explicitly and Codex CLI
+will download it to `~/.local/bin/Codex.AppImage`, mark it executable, and
+launch it:
+
+```bash
+codex app --download-url https://example.com/path/to/Codex.AppImage
+```
+
+> AppImages on Ubuntu 24.04+ require `libfuse2t64`
+> (`sudo apt install libfuse2t64`). Wayland sessions typically need
+> `--ozone-platform-hint=auto`.
+
+To be notified when OpenAI ships an official Linux build, sign up at
+<https://openai.com/form/codex-app/>.
+
 ## Tracing / verbose logging
 
 Codex is written in Rust, so it honors the `RUST_LOG` environment variable to configure its logging behavior.
