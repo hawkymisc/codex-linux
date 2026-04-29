@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use codex_markdown_ast::IncrementalParser;
 use codex_markdown_ast::parse_full;
 use gtk::glib;
 use gtk::glib::Properties;
@@ -25,6 +26,18 @@ thread_local! {
     /// disconnects them. The list-item factory is single-threaded (GTK
     /// main loop), so a thread-local is sufficient.
     static BIND_HANDLERS: RefCell<HashMap<usize, (SignalHandlerId, SignalHandlerId)>> =
+        RefCell::new(HashMap::new());
+
+    /// Per-streaming-`MessageBlock` incremental markdown parser, keyed
+    /// by the `MessageBlock` GObject pointer (cast to `usize`). The key
+    /// is only ever inserted while the block is still alive in the
+    /// chat-pane's `GListStore` and is evicted on
+    /// [`ChatPane::finalise_assistant_block`], so we never observe
+    /// pointer reuse: GLib refcounts keep the block alive across notify
+    /// rebuilds, and the eviction step happens before the block is
+    /// dropped from the store. GTK runs all of this on the main thread,
+    /// so a thread-local keeps `Send + Sync` headaches away.
+    static INC_PARSERS: RefCell<HashMap<usize, IncrementalParser>> =
         RefCell::new(HashMap::new());
 }
 
@@ -336,13 +349,35 @@ impl ChatPane {
         *self.submit_cb.borrow_mut() = Some(Rc::new(cb));
     }
 
+    /// Return the most recent `assistant` MessageBlock in the transcript,
+    /// if any. Used by the incremental streaming path (and by tests) to
+    /// look up the current row.
+    #[allow(dead_code)]
+    pub(crate) fn last_assistant_block(&self) -> Option<MessageBlock> {
+        let n = self.store.n_items();
+        for i in (0..n).rev() {
+            if let Some(item) = self.store.item(i)
+                && let Some(block) = item.downcast_ref::<MessageBlock>()
+                && block.role() == "assistant"
+            {
+                return Some(block.clone());
+            }
+        }
+        None
+    }
+
     /// Append `delta` to the most recent unfinalised assistant block.
     ///
     /// If the most recent block is not an assistant block — or it has
-    /// already been finalised — a fresh `assistant` row is appended. The
-    /// streaming controller in PR-F will replace the in-place text
-    /// concatenation with rich markdown rendering; for now we just keep a
-    /// running plain-text buffer.
+    /// already been finalised — a fresh `assistant` row is appended.
+    ///
+    /// In addition to growing the cumulative `text` property, this routine
+    /// pushes the delta into the per-block [`IncrementalParser`] in the
+    /// `INC_PARSERS` thread-local cache *before* `set_text` triggers the
+    /// `text-notify` signal. The list-item factory rebuilds the row on
+    /// that notify and reads the parser's `blocks()` snapshot, so the
+    /// "push first, notify second" order keeps the rendered widgets in
+    /// sync with the cumulative source.
     pub fn start_or_extend_assistant_block(&self, delta: &str) {
         let n = self.store.n_items();
         if n > 0 {
@@ -354,19 +389,36 @@ impl ChatPane {
             {
                 let mut combined = block.text();
                 combined.push_str(delta);
+                let key = block.as_ptr() as usize;
+                INC_PARSERS.with(|cell| {
+                    let mut map = cell.borrow_mut();
+                    let parser = map.entry(key).or_default();
+                    let _ = parser.push(delta);
+                });
                 block.set_text(combined);
                 // ColumnView listens to property notifications, so this
-                // re-binds the row label automatically.
+                // re-binds the row automatically; the rebuild reads the
+                // parser snapshot we just advanced above.
                 return;
             }
         }
-        let block = MessageBlock::new("assistant", delta);
+        let block = MessageBlock::new("assistant", "");
+        let key = block.as_ptr() as usize;
+        INC_PARSERS.with(|cell| {
+            let mut map = cell.borrow_mut();
+            let parser = map.entry(key).or_default();
+            let _ = parser.push(delta);
+        });
+        // Now set the text so the bind path observes a parser entry.
+        block.set_text(delta);
         self.store.append(&block);
     }
 
     /// Mark the most recent assistant block as finalised. Optionally
     /// appends a small footer indicating the stop reason if it's not a
-    /// boring `end_turn`.
+    /// boring `end_turn`. Also evicts the block's incremental parser
+    /// from the `INC_PARSERS` cache so memory grows only with the
+    /// number of in-flight streams, not the lifetime of the session.
     pub fn finalise_assistant_block(&self, stop_reason: &str) {
         let n = self.store.n_items();
         if n == 0 {
@@ -388,6 +440,10 @@ impl ChatPane {
             text.push_str(&format!("\n(stop: {stop_reason})"));
             block.set_text(text);
         }
+        let key = block.as_ptr() as usize;
+        INC_PARSERS.with(|cell| {
+            cell.borrow_mut().remove(&key);
+        });
     }
 
     /// Append a system block stating that the agent has disconnected.
@@ -431,8 +487,12 @@ impl Default for ChatPane {
 /// - First child = a small role label header rendered with Pango markup
 ///   (safe — role display names are hardcoded constants).
 /// - Body = either a single `gtk::Label` (user input, system messages,
-///   or streaming assistant text) or one widget per `MdBlock` produced
-///   by [`crate::md_to_widgets::block_to_widget`] (finalised assistant).
+///   or pre-first-delta streaming assistant text), one widget per
+///   `MdBlock` produced by [`crate::md_to_widgets::block_to_widget`] for
+///   finalised assistant blocks, or — for *streaming* assistant blocks
+///   that already have a parser entry in `INC_PARSERS` — a vertical
+///   `gtk::Box` containing one widget per `MdBlock` in the parser's
+///   current snapshot followed by a faint streaming-cursor marker.
 fn build_message_row(block: &MessageBlock) -> gtk::Widget {
     let role = block.role();
     let outer = gtk::Box::builder()
@@ -459,8 +519,48 @@ fn build_message_row(block: &MessageBlock) -> gtk::Widget {
 
     // Body.
     let text = block.text();
-    let render_as_label = role == "user" || role == "system" || !block.finalised();
-    if render_as_label {
+    let is_streaming_assistant = role == "assistant" && !block.finalised();
+
+    if is_streaming_assistant {
+        // Streaming assistant: prefer the incremental parser snapshot if
+        // we have one. The parser is keyed by the GObject pointer; we
+        // copy the blocks out under the borrow so we don't keep the
+        // RefCell borrowed across widget construction.
+        let key = block.as_ptr() as usize;
+        let blocks_opt = INC_PARSERS.with(|cell| {
+            cell.borrow()
+                .get(&key)
+                .map(|p| p.blocks().to_vec())
+        });
+        match blocks_opt {
+            Some(md_blocks) if !md_blocks.is_empty() => {
+                let body = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(4)
+                    .build();
+                for md_block in &md_blocks {
+                    body.append(&block_to_widget(md_block));
+                }
+                let cursor = gtk::Label::new(Some("\u{258D}"));
+                cursor.add_css_class("codex-streaming-cursor");
+                cursor.set_xalign(0.0);
+                body.append(&cursor);
+                outer.append(&body);
+            }
+            _ => {
+                // Pre-first-delta or empty parser: keep the simple-Label
+                // shape so the row still has a body child.
+                let body = gtk::Label::builder()
+                    .label(&text)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .xalign(0.0)
+                    .selectable(true)
+                    .build();
+                outer.append(&body);
+            }
+        }
+    } else if role == "user" || role == "system" {
         let body = gtk::Label::builder()
             .label(&text)
             .wrap(true)
@@ -607,8 +707,12 @@ mod tests {
         if !ensure_gtk() {
             return;
         }
+        // No parser entry exists for this bare block — the streaming
+        // path must fall back to the single-Label shape (header + Label).
+        // Once an `IncrementalParser` has been advanced for the block
+        // (see `streaming_assistant_block_renders_incremental_widgets`),
+        // the body becomes a Box of MdBlock widgets instead.
         let block = MessageBlock::new("assistant", "# streaming...");
-        // finalised defaults to false.
         assert!(!block.finalised());
         let row = build_message_row(&block);
         let bx: gtk::Box = row.downcast().expect("row is a Box");
@@ -618,12 +722,89 @@ mod tests {
         assert_eq!(
             children.len(),
             2,
-            "streaming row should be header + single Label"
+            "pre-first-delta streaming row should be header + single Label"
         );
+        // Body is either a Label (no parser) or a Box (parser cached).
+        // For this test no parser entry was inserted, so we assert the
+        // simple-Label shape.
         let body: gtk::Label = children[1]
             .clone()
             .downcast()
-            .expect("streaming body should be a Label");
+            .expect("streaming body should be a Label when no parser is cached");
         assert_eq!(body.text().to_string(), "# streaming...");
+    }
+
+    #[test]
+    fn streaming_assistant_block_renders_incremental_widgets() {
+        if !ensure_gtk() {
+            return;
+        }
+        let pane = ChatPane::new();
+        pane.start_or_extend_assistant_block("**hello** ");
+        pane.start_or_extend_assistant_block("world");
+        let block = pane
+            .last_assistant_block()
+            .expect("assistant block should exist after two deltas");
+        let row = build_message_row(&block);
+        let outer: gtk::Box = row.downcast().expect("row is a Box");
+        assert!(outer.has_css_class("codex-msg-assistant"));
+        assert!(outer.has_css_class("codex-msg-streaming"));
+        // Walk children — at minimum we expect a role header label AND
+        // the content body (a Box of MdBlock widgets ending in the
+        // streaming cursor).
+        let mut count = 0;
+        let mut child = outer.first_child();
+        while let Some(c) = child {
+            count += 1;
+            child = c.next_sibling();
+        }
+        assert!(count >= 2, "row should contain header + body, got {count}");
+        // The body should be a Box (because a parser is cached and has
+        // produced at least one MdBlock).
+        let children = box_children(&outer);
+        let body: gtk::Box = children[1]
+            .clone()
+            .downcast()
+            .expect("streaming body should be a Box once the parser has parsed content");
+        // Body should contain at least one MdBlock widget plus the
+        // streaming cursor at the end.
+        let body_children = box_children(&body);
+        assert!(
+            body_children.len() >= 2,
+            "body should contain MdBlock widget(s) + cursor, got {}",
+            body_children.len()
+        );
+        let last = body_children
+            .last()
+            .expect("body has a final cursor child")
+            .clone();
+        let cursor: gtk::Label = last
+            .downcast()
+            .expect("final body child should be the cursor Label");
+        assert!(cursor.has_css_class("codex-streaming-cursor"));
+    }
+
+    #[test]
+    fn finalising_assistant_block_evicts_parser() {
+        if !ensure_gtk() {
+            return;
+        }
+        let pane = ChatPane::new();
+        pane.start_or_extend_assistant_block("**hello**");
+        let block = pane
+            .last_assistant_block()
+            .expect("assistant block should exist after a delta");
+        let key = block.as_ptr() as usize;
+        // Sanity check: parser entry exists prior to finalise.
+        let present_before =
+            INC_PARSERS.with(|cell| cell.borrow().contains_key(&key));
+        assert!(present_before, "parser must be cached during streaming");
+        pane.finalise_assistant_block("end_turn");
+        INC_PARSERS.with(|cell| {
+            assert!(
+                !cell.borrow().contains_key(&key),
+                "parser must be evicted on finalise"
+            );
+        });
     }
 }
