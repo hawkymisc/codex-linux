@@ -32,7 +32,7 @@ codex-markdown-ast = { path = "../markdown-ast" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 

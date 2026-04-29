@@ -1,0 +1,18 @@
+schema_version = 1
+description = "Agent emits FileChange; UI approves; on-disk hash matches expected."
+tags = ["file-change", "approval"]
+timeout_ms = 30000
+
+[input]
+prompt = "rename foo to bar in src/lib.rs"
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "item/file_change/request_approval"
+match = { params = { paths = ["src/lib.rs"] } }
+respond_with = { decision = "approved" }
+
+[[expected_events]]
+method = "turn/completed"

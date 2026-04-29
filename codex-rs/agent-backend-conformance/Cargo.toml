@@ -1,11 +1,11 @@
 [package]
-name = "codex-agent-backend"
+name = "codex-agent-backend-conformance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "codex_agent_backend"
+name = "codex_agent_backend_conformance"
 path = "src/lib.rs"
 
 [lints]
@@ -13,16 +13,14 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-codex-jsonrpc-framing = { workspace = true }
+codex-agent-backend = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["std"] }
-inventory = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "process", "sync", "io-util"] }
-tokio-stream = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "process", "sync", "io-util", "time"] }

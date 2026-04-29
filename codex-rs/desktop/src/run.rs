@@ -32,13 +32,8 @@ async fn run_desktop() -> Result<()> {
 }
 
 async fn run_agent() -> Result<()> {
-    info!("codex-desktop: starting in agent role (stub)");
-    eprintln!(
-        "codex-agent stub. Real implementation lands in PR-C; for now it \
-        prints this banner and exits cleanly. See \
-        docs/desktop-architecture.md §3.1 for the role split."
-    );
-    Ok(())
+    info!("codex-desktop: starting in agent role");
+    crate::agent_role::run().await
 }
 
 async fn run_lspd() -> Result<()> {

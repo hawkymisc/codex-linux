@@ -1,0 +1,17 @@
+schema_version = 1
+description = "Pending-approval queue: agent stalls awaiting decision; UI sends decision; turn resumes."
+tags = ["approval"]
+timeout_ms = 30000
+
+[input]
+prompt = "edit foo.txt"
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "item/file_change/request_approval"
+respond_with = { decision = "denied" }
+
+[[expected_events]]
+method = "turn/completed"

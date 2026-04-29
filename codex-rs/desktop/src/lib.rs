@@ -10,6 +10,7 @@
 //! The actual GUI code lives behind the `gtk` cargo feature so that the
 //! workspace can build in CI environments without GTK development headers.
 
+pub mod agent_role;
 pub mod role;
 pub mod run;
 

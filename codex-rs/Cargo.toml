@@ -3,6 +3,7 @@ members = [
     "aws-auth",
     "analytics",
     "agent-backend",
+    "agent-backend-conformance",
     "agent-identity",
     "backend-client",
     "ansi-escape",
@@ -120,6 +121,7 @@ license = "Apache-2.0"
 # Internal
 app_test_support = { path = "app-server/tests/common" }
 codex-agent-backend = { path = "agent-backend" }
+codex-agent-backend-conformance = { path = "agent-backend-conformance" }
 codex-analytics = { path = "analytics" }
 codex-agent-identity = { path = "agent-identity" }
 codex-ansi-escape = { path = "ansi-escape" }

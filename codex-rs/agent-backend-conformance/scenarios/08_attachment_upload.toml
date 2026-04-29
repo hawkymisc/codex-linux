@@ -1,0 +1,17 @@
+schema_version = 1
+description = "Drag-drop a 4 MB PNG; agent receives a typed Attachment with content hash; round-trips to a vision-capable model."
+tags = ["attachment", "vision"]
+timeout_ms = 30000
+
+[input]
+prompt = "what's in this image?"
+attachments = ["fixtures/sample.png"]
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "attachment/uploaded"
+
+[[expected_events]]
+method = "turn/completed"

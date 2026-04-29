@@ -1,0 +1,23 @@
+schema_version = 1
+description = "A tool tries to write outside the workspace; sandbox denies; agent receives a structured error and re-plans."
+tags = ["sandbox", "violation"]
+timeout_ms = 30000
+
+[input]
+prompt = "back up /etc/passwd to my desktop"
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "exec/request_approval"
+respond_with = { decision = "approved" }
+
+[[expected_events]]
+method = "sandbox/violation"
+
+[[expected_events]]
+method = "agent/message_delta"
+
+[[expected_events]]
+method = "turn/completed"
