@@ -28,6 +28,7 @@ members = [
     "collaboration-mode-templates",
     "connectors",
     "config",
+    "content-search",
     "desktop",
     "device-key",
     "shell-command",
@@ -145,6 +146,7 @@ codex-cloud-tasks-mock-client = { path = "cloud-tasks-mock-client" }
 codex-code-mode = { path = "code-mode" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
+codex-content-search = { path = "content-search" }
 codex-core = { path = "core" }
 codex-core-plugins = { path = "core-plugins" }
 codex-core-skills = { path = "core-skills" }

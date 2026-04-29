@@ -21,13 +21,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader,
 };
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// How long to wait for the language server's `initialize` reply before
+/// giving up. Real servers (rust-analyzer warm) respond well under a second;
+/// 30s is a generous upper bound that covers cold-cache CI runs.
+const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SUPPORTED_NOTIFICATIONS: &[&str] = &["textDocument/publishDiagnostics"];
 const SUPPORTED_METHODS: &[&str] = &[
@@ -159,7 +167,7 @@ async fn handle_request(supervisor: &Arc<Supervisor>, req: JsonRpcRequest) -> Va
 // SpawnFailed and the LspMessage helper land alongside the actual
 // rust-analyzer spawn flow in PR-I-2; the framing/dispatch layer here
 // is intentionally a load-bearing first slice.
-enum LspdError {
+pub(crate) enum LspdError {
     UnknownLanguage(String),
     SpawnFailed(String, String),
     Other(String),
@@ -180,8 +188,20 @@ async fn handle_lsp_start(supervisor: &Arc<Supervisor>, params: &Value) -> Resul
     let (bin, args) = server_invocation(&p.language)
         .ok_or_else(|| LspdError::UnknownLanguage(p.language.clone()))?;
 
-    // Spawn-skip: don't actually launch in the smoke path; report the
-    // would-be invocation. The full spawn flow is a follow-up PR.
+    // Opt-in: real spawn path is gated by `CODEX_LSPD_REAL_SPAWN=1` so the
+    // unit-test path stays hermetic. Production sets the env var; PR-M2
+    // wires fine-grained didChange/publishDiagnostics forwarding on top.
+    if std::env::var_os("CODEX_LSPD_REAL_SPAWN").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let (server_id, capabilities) =
+            start_real_server(supervisor, &p.language, p.root_uri.as_deref()).await?;
+        return Ok(json!({
+            "server_id": server_id,
+            "capabilities": capabilities,
+        }));
+    }
+
+    // Default placeholder path (kept for hermetic tests and for callers that
+    // just want to validate the language table without paying spawn cost).
     let server_id = supervisor
         .next_id()
         .map_err(|e| LspdError::Other(e.to_string()))?;
@@ -190,6 +210,151 @@ async fn handle_lsp_start(supervisor: &Arc<Supervisor>, params: &Value) -> Resul
         "would_invoke": { "bin": bin, "args": args },
         "note": "spawn deferred; PR-I lands the framing & dispatch layer only",
     }))
+}
+
+/// Spawn the configured language server for `language`, drive the LSP
+/// `initialize` handshake, return `(server_id, capabilities)`.
+///
+/// Sends `initialized`, then `shutdown` + `exit`, then kills the child —
+/// this PR (M) only proves the spawn-and-init path works. Streaming
+/// didChange / publishDiagnostics forwarding is PR-M2.
+pub(crate) async fn start_real_server(
+    supervisor: &Arc<Supervisor>,
+    language: &str,
+    root_uri: Option<&str>,
+) -> Result<(String, Value), LspdError> {
+    let (bin, args) =
+        server_invocation(language).ok_or_else(|| LspdError::UnknownLanguage(language.into()))?;
+    let capabilities = try_spawn_and_init_with(bin, args, root_uri).await?;
+    let server_id = supervisor
+        .next_id()
+        .map_err(|e| LspdError::Other(e.to_string()))?;
+    Ok((server_id, capabilities))
+}
+
+/// Pure spawn + initialize helper, parameterised on the binary so tests can
+/// drive the SpawnFailed path with a known-missing executable without
+/// monkey-patching the static `server_invocation` table.
+pub(crate) async fn try_spawn_and_init_with(
+    bin: &str,
+    args: &[&str],
+    root_uri: Option<&str>,
+) -> Result<Value, LspdError> {
+    let mut child = match Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LspdError::SpawnFailed(bin.into(), "not found on PATH".into()));
+        }
+        Err(e) => return Err(LspdError::SpawnFailed(bin.into(), e.to_string())),
+    };
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| LspdError::Other("child stdin was not piped".into()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| LspdError::Other("child stdout was not piped".into()))?;
+
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "rootPath": Value::Null,
+            "capabilities": {
+                "workspace": { "applyEdit": false, "workspaceEdit": null },
+                "textDocument": {
+                    "synchronization": { "didSave": true },
+                    "publishDiagnostics": { "relatedInformation": false },
+                },
+            },
+            "clientInfo": {
+                "name": "codex-lspd",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "workspaceFolders": Value::Null,
+            "trace": "off",
+        },
+    });
+
+    // Run the whole init handshake under a single timeout so a wedged or
+    // mis-built server can't hang the dispatcher loop.
+    let capabilities = tokio::time::timeout(INIT_TIMEOUT, async {
+        write_lsp_frame(&mut stdin, &init)
+            .await
+            .map_err(|e| LspdError::Other(format!("write initialize: {e}")))?;
+
+        loop {
+            let frame = read_lsp_frame(&mut stdout)
+                .await
+                .map_err(|e| LspdError::Other(format!("read frame: {e}")))?;
+            let Some(text) = frame else {
+                return Err(LspdError::Other(
+                    "language server closed stdout before initialize reply".into(),
+                ));
+            };
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|e| LspdError::Other(format!("parse frame as JSON: {e}")))?;
+
+            // Notifications (no `id`) — diagnostics, log messages, progress —
+            // can legitimately arrive before the initialize reply. Just log
+            // and keep waiting.
+            let Some(id) = value.get("id") else {
+                debug!(method = ?value.get("method"), "lspd: ignoring pre-init notification");
+                continue;
+            };
+
+            // Match our request id (1). LSP allows servers to send their own
+            // requests during init (e.g. window/workDoneProgress/create),
+            // which carry a different id and no `result` — skip them too.
+            if id != &json!(1) {
+                debug!(?id, "lspd: ignoring server-originated request during init");
+                continue;
+            }
+
+            let caps = value
+                .get("result")
+                .and_then(|r| r.get("capabilities"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            return Ok::<Value, LspdError>(caps);
+        }
+    })
+    .await
+    .map_err(|_| LspdError::Other(format!("initialize timed out after {INIT_TIMEOUT:?}")))??;
+
+    // Best-effort `initialized` notification. If the server has already gone
+    // away the spawn path still counts as "worked" for test purposes.
+    let initialized = json!({"jsonrpc": "2.0", "method": "initialized", "params": {}});
+    if let Err(e) = write_lsp_frame(&mut stdin, &initialized).await {
+        debug!(error = %e, "lspd: best-effort initialized notification failed");
+    }
+
+    // Polite shutdown: real production lifecycle (long-lived servers,
+    // restart-on-crash) lands in PR-M2.
+    let shutdown = json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"});
+    let exit = json!({"jsonrpc": "2.0", "method": "exit"});
+    if let Err(e) = write_lsp_frame(&mut stdin, &shutdown).await {
+        debug!(error = %e, "lspd: best-effort shutdown failed");
+    }
+    if let Err(e) = write_lsp_frame(&mut stdin, &exit).await {
+        debug!(error = %e, "lspd: best-effort exit failed");
+    }
+    if let Err(e) = child.kill().await {
+        debug!(error = %e, "lspd: child.kill() failed (likely already exited)");
+    }
+
+    Ok(capabilities)
 }
 
 /// Static table of language → server invocation. Public for tests.
@@ -401,6 +566,48 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","id":"99","method":"shutdown"}"#;
         let resp = dispatch_line(&supervisor, line).await?;
         assert_eq!(resp["result"]["shutdown"], json!(true));
+        Ok(())
+    }
+
+    /// SpawnFailed path: parameterised helper means we don't need to mutate
+    /// the static `server_invocation` table to exercise the missing-binary
+    /// branch — call `try_spawn_and_init_with` directly with garbage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lsp_start_with_unknown_binary_returns_spawn_failed() -> Result<()> {
+        let err = try_spawn_and_init_with("definitely-not-a-real-binary-9z9z", &[], None)
+            .await
+            .err()
+            .context("spawn must fail for missing binary")?;
+        assert!(matches!(err, LspdError::SpawnFailed(_, _)));
+        Ok(())
+    }
+
+    /// Real-server smoke test. Opt-in via `CODEX_LSPD_REAL_SPAWN_TEST=1` so
+    /// CI without rust-analyzer (and the default `cargo test` invocation)
+    /// skips it cleanly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lsp_start_with_real_spawn_initializes_when_on_path() -> Result<()> {
+        if std::env::var_os("CODEX_LSPD_REAL_SPAWN_TEST").is_none() {
+            eprintln!("skip: set CODEX_LSPD_REAL_SPAWN_TEST=1 to run");
+            return Ok(());
+        }
+        if which::which("rust-analyzer").is_err() {
+            eprintln!("skip: rust-analyzer not on PATH");
+            return Ok(());
+        }
+        let supervisor = Arc::new(Supervisor::new());
+        let timed = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            start_real_server(&supervisor, "rust", Some("file:///tmp")),
+        )
+        .await
+        .context("real-spawn test wall-clock timeout")?;
+        let (server_id, capabilities) = match timed {
+            Ok(v) => v,
+            Err(e) => anyhow::bail!("start_real_server returned an LspdError: {e:?}"),
+        };
+        assert!(server_id.starts_with("srv"));
+        assert!(capabilities.is_object(), "capabilities must be a JSON object");
         Ok(())
     }
 }
