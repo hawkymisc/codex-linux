@@ -10,6 +10,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use anyhow::Result;
 use gtk::glib;
+use tokio::runtime::Handle;
+
+use crate::agent_bridge::{AgentBridge, BridgeEvent};
 
 use super::chat_pane::ChatPane;
 use super::editor_pane::EditorPane;
@@ -25,6 +28,10 @@ const SIDEBAR_BREAKPOINT_PX: f64 = 720.0;
 pub struct AppState {
     pub workspace_root: PathBuf,
     pub open_tabs: Vec<EditorPane>,
+    /// Handle to the agent bridge, populated once the GUI activates.
+    /// `None` if the bridge failed to spawn — the GUI still runs, the
+    /// chat pane just falls back to local-echo behaviour.
+    pub agent_bridge: Option<Rc<AgentBridge>>,
 }
 
 impl AppState {
@@ -32,6 +39,7 @@ impl AppState {
         Self {
             workspace_root,
             open_tabs: Vec::new(),
+            agent_bridge: None,
         }
     }
 }
@@ -50,7 +58,7 @@ pub struct MainWindow {
 }
 
 impl MainWindow {
-    fn build(app: &adw::Application) -> Self {
+    fn build(app: &adw::Application, rt_handle: Handle) -> Self {
         theme::install();
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -133,11 +141,62 @@ impl MainWindow {
         };
         main.wire_signals();
         main.install_shortcuts();
+        main.wire_agent_bridge(rt_handle);
 
         // Open one empty editor tab by default.
         main.open_empty_tab();
 
         main
+    }
+
+    /// Spawn the agent bridge and route its events into the chat pane.
+    ///
+    /// On bridge spawn failure we log a warning and surface a system
+    /// message in the chat pane; the rest of the GUI continues to
+    /// function. The send button still echoes the user's text locally.
+    fn wire_agent_bridge(&self, rt_handle: Handle) {
+        let bridge = match AgentBridge::spawn(rt_handle) {
+            Ok(b) => Rc::new(b),
+            Err(err) => {
+                tracing::warn!(error = %err, "gui: failed to spawn agent bridge");
+                self.chat.append_message(
+                    "system",
+                    "Could not start the agent backend; messages will not be processed.",
+                );
+                return;
+            }
+        };
+
+        // Install the submit-callback into the chat pane so the Send
+        // button forwards prompts to the bridge.
+        let submit_bridge = Rc::clone(&bridge);
+        self.chat.set_submit_callback(move |prompt| {
+            submit_bridge.submit(prompt);
+        });
+
+        // Drain the bridge's event channel from the GTK main loop. We
+        // hold a weak reference to the chat pane so dropping the window
+        // does not keep the receiver task alive forever.
+        if let Some(mut events_rx) = bridge.take_events_rx() {
+            let chat = self.chat.clone();
+            glib::MainContext::default().spawn_local(async move {
+                while let Some(event) = events_rx.recv().await {
+                    match event {
+                        BridgeEvent::MessageDelta { text } => {
+                            chat.start_or_extend_assistant_block(&text);
+                        }
+                        BridgeEvent::TurnCompleted { stop_reason } => {
+                            chat.finalise_assistant_block(&stop_reason);
+                        }
+                        BridgeEvent::AgentClosed => {
+                            chat.show_agent_disconnected();
+                        }
+                    }
+                }
+            });
+        }
+
+        self.state.borrow_mut().agent_bridge = Some(bridge);
     }
 
     fn wire_signals(&self) {
@@ -284,14 +343,15 @@ impl MainWindow {
 
 /// Run the GTK main loop. **Synchronous** — GTK takes over the calling
 /// thread. `crate::run::run_desktop` invokes us inside
-/// `tokio::task::spawn_blocking`.
-pub fn run_main_window() -> Result<()> {
+/// `tokio::task::spawn_blocking` and threads its tokio runtime handle
+/// through so the agent bridge can spawn tasks on the same runtime.
+pub fn run_main_window(rt_handle: Handle) -> Result<()> {
     tracing::info!("gui: building adw::Application id={APP_ID}");
 
     let app = adw::Application::builder().application_id(APP_ID).build();
 
-    app.connect_activate(|app| {
-        let main = MainWindow::build(app);
+    app.connect_activate(move |app| {
+        let main = MainWindow::build(app, rt_handle.clone());
         main.present();
     });
 

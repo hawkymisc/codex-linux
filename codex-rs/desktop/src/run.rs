@@ -18,8 +18,12 @@ async fn run_desktop() -> Result<()> {
     #[cfg(feature = "gtk")]
     {
         // GTK's main loop is blocking, so run it on a dedicated blocking
-        // thread to keep the tokio runtime usable.
-        tokio::task::spawn_blocking(crate::gui::run_main_window).await?
+        // thread to keep the tokio runtime usable. We capture the
+        // current runtime handle BEFORE moving into the blocking
+        // closure so the GUI side can spawn tokio tasks (the agent
+        // bridge) on the same runtime.
+        let rt_handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || crate::gui::run_main_window(rt_handle)).await?
     }
 
     #[cfg(not(feature = "gtk"))]

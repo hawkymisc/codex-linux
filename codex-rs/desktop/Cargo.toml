@@ -30,6 +30,7 @@ clap = { workspace = true, features = ["derive"] }
 codex-agent-backend = { path = "../agent-backend" }
 codex-jsonrpc-framing = { path = "../jsonrpc-framing" }
 codex-markdown-ast = { workspace = true }
+futures = { workspace = true, default-features = false, features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

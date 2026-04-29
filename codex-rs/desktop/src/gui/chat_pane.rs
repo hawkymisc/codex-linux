@@ -5,7 +5,9 @@
 //! For PR-B the pane just echoes the composer text back as a "user"
 //! message and seeds a single welcome message.
 
+use std::cell::Cell;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -22,6 +24,12 @@ mod imp {
         pub role: RefCell<String>,
         #[property(get, set)]
         pub text: RefCell<String>,
+        /// `true` once an assistant block has received its terminating
+        /// `agent/turn_completed` notification. Used by the streaming path
+        /// to decide whether to extend the most recent block or start a
+        /// new one when a new `message_delta` arrives.
+        #[property(get, set)]
+        pub finalised: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -54,6 +62,12 @@ impl Default for MessageBlock {
     }
 }
 
+/// Type alias for the optional submission callback: invoked with the
+/// trimmed composer text when the user clicks Send. The pane stores it
+/// behind a `RefCell<Rc<...>>` so [`ChatPane::set_submit_callback`] can
+/// install the bridge after construction.
+pub type SubmitCallback = Rc<dyn Fn(String) + 'static>;
+
 /// The chat pane widget. Holds the backing `GListStore` and exposes
 /// helpers for appending messages.
 #[derive(Clone)]
@@ -61,6 +75,11 @@ pub struct ChatPane {
     root: gtk::Box,
     store: gtk::gio::ListStore,
     composer: sourceview5::View,
+    /// Forward-the-prompt-to-the-agent hook. Set by
+    /// [`ChatPane::set_submit_callback`] once the bridge is constructed.
+    /// `None` until then, in which case the Send button only adds the
+    /// user message locally without invoking any backend.
+    submit_cb: Rc<RefCell<Option<SubmitCallback>>>,
 }
 
 impl ChatPane {
@@ -202,6 +221,7 @@ impl ChatPane {
             root,
             store,
             composer,
+            submit_cb: Rc::new(RefCell::new(None)),
         };
 
         // Wire the Send button to push the composer text into the chat.
@@ -239,6 +259,77 @@ impl ChatPane {
         self.store.n_items()
     }
 
+    /// Install the submission callback. Replaces any previously installed
+    /// callback; passing a fresh closure is the supported way to reset.
+    ///
+    /// The pane invokes `cb` with the trimmed composer text whenever the
+    /// user clicks Send, after appending a "user" `MessageBlock` locally.
+    pub fn set_submit_callback<F>(&self, cb: F)
+    where
+        F: Fn(String) + 'static,
+    {
+        *self.submit_cb.borrow_mut() = Some(Rc::new(cb));
+    }
+
+    /// Append `delta` to the most recent unfinalised assistant block.
+    ///
+    /// If the most recent block is not an assistant block — or it has
+    /// already been finalised — a fresh `assistant` row is appended. The
+    /// streaming controller in PR-F will replace the in-place text
+    /// concatenation with rich markdown rendering; for now we just keep a
+    /// running plain-text buffer.
+    pub fn start_or_extend_assistant_block(&self, delta: &str) {
+        let n = self.store.n_items();
+        if n > 0 {
+            let last_idx = n - 1;
+            if let Some(item) = self.store.item(last_idx)
+                && let Some(block) = item.downcast_ref::<MessageBlock>()
+                && block.role() == "assistant"
+                && !block.finalised()
+            {
+                let mut combined = block.text();
+                combined.push_str(delta);
+                block.set_text(combined);
+                // ColumnView listens to property notifications, so this
+                // re-binds the row label automatically.
+                return;
+            }
+        }
+        let block = MessageBlock::new("assistant", delta);
+        self.store.append(&block);
+    }
+
+    /// Mark the most recent assistant block as finalised. Optionally
+    /// appends a small footer indicating the stop reason if it's not a
+    /// boring `end_turn`.
+    pub fn finalise_assistant_block(&self, stop_reason: &str) {
+        let n = self.store.n_items();
+        if n == 0 {
+            return;
+        }
+        let last_idx = n - 1;
+        let Some(item) = self.store.item(last_idx) else {
+            return;
+        };
+        let Some(block) = item.downcast_ref::<MessageBlock>() else {
+            return;
+        };
+        if block.role() != "assistant" {
+            return;
+        }
+        block.set_finalised(true);
+        if !stop_reason.is_empty() && stop_reason != "end_turn" {
+            let mut text = block.text();
+            text.push_str(&format!("\n(stop: {stop_reason})"));
+            block.set_text(text);
+        }
+    }
+
+    /// Append a system block stating that the agent has disconnected.
+    pub fn show_agent_disconnected(&self) {
+        self.append_message("system", "Agent disconnected.");
+    }
+
     fn send_from_composer(&self) {
         let buffer = self.composer.buffer();
         let (start, end) = buffer.bounds();
@@ -247,8 +338,15 @@ impl ChatPane {
         if trimmed.is_empty() {
             return;
         }
-        self.append_message("user", trimmed);
+        let owned = trimmed.to_string();
+        self.append_message("user", &owned);
         buffer.set_text("");
+        // Forward to the bridge if one is installed. Cloning the inner
+        // `Rc` keeps the borrow short-lived.
+        let cb_opt = self.submit_cb.borrow().as_ref().map(Rc::clone);
+        if let Some(cb) = cb_opt {
+            cb(owned);
+        }
     }
 }
 

@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     init_tracing();
 
     let argv0: OsString = std::env::args_os().next().unwrap_or_default();
-    let detected = role::detect_role_from_argv0(&argv0);
+    let detected = role::detect_role(&argv0);
 
     // Build a single-threaded current-thread runtime by default; GTK has its
     // own main loop and we want the tokio runtime to live on a worker thread

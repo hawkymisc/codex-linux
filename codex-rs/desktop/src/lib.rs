@@ -16,6 +16,9 @@ pub mod run;
 pub mod wal;
 
 #[cfg(feature = "gtk")]
+pub mod agent_bridge;
+
+#[cfg(feature = "gtk")]
 pub mod gui;
 
 #[cfg(feature = "gtk")]
