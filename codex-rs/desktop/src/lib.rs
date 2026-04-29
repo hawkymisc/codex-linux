@@ -11,6 +11,7 @@
 //! workspace can build in CI environments without GTK development headers.
 
 pub mod agent_role;
+pub mod lspd_role;
 pub mod role;
 pub mod run;
 pub mod wal;

@@ -43,10 +43,6 @@ async fn run_agent() -> Result<()> {
 }
 
 async fn run_lspd() -> Result<()> {
-    info!("codex-desktop: starting in lspd role (stub)");
-    eprintln!(
-        "codex-lspd stub. Real implementation lands in PR-D (LSP/lint \
-        multiplexer). See docs/desktop-architecture.md §3.1."
-    );
-    Ok(())
+    info!("codex-desktop: starting in lspd role");
+    crate::lspd_role::run().await
 }
