@@ -23,6 +23,31 @@ default = []
 # packages (.deb, AppImage, Flatpak) all build with `--features gtk`.
 gtk = ["dep:gtk", "dep:adw", "dep:sourceview5", "dep:glib"]
 
+[package.metadata.deb]
+name = "codex-desktop"
+maintainer = "OpenAI <opensource@openai.com>"
+copyright = "2026, OpenAI <opensource@openai.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """
+Codex Desktop is a Linux-native, libadwaita-styled IDE that wraps the
+Codex CLI agent (and, optionally, Claude Code) behind a single GUI.
+See <https://github.com/openai/codex> for details."""
+section = "devel"
+priority = "optional"
+depends = "$auto, libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.4), libgtksourceview-5-0"
+features = ["gtk"]
+assets = [
+    ["target/release/codex-desktop",                                            "usr/bin/",                                                          "755"],
+    ["packaging/dev.codex.Desktop.desktop",                                     "usr/share/applications/",                                           "644"],
+    ["packaging/dev.codex.Desktop.metainfo.xml",                                "usr/share/metainfo/",                                               "644"],
+    ["packaging/icons/hicolor/scalable/apps/dev.codex.Desktop.svg",             "usr/share/icons/hicolor/scalable/apps/",                            "644"],
+    ["../../docs/desktop-architecture.md",                                      "usr/share/doc/codex-desktop/architecture.md",                       "644"],
+    ["README.md",                                                               "usr/share/doc/codex-desktop/README.md",                             "644"],
+    ["packaging/symlinks/codex-agent",                                          "usr/libexec/codex-desktop/",                                        "755"],
+    ["packaging/symlinks/codex-lspd",                                           "usr/libexec/codex-desktop/",                                        "755"],
+]
+maintainer-scripts = "packaging/debian"
+
 [dependencies]
 anyhow = { workspace = true }
 ciborium = "0.2"

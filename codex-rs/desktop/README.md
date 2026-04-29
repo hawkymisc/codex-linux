@@ -72,3 +72,52 @@ cargo clippy -p codex-desktop --features gtk --tests
 ```
 
 The lib tests use a `OnceLock<bool>` guard that skips widget-construction tests when `gtk::init()` fails on a headless runner (no `DISPLAY`/`WAYLAND_DISPLAY`).
+
+## Distribution
+
+A real Debian package can be produced with [`cargo-deb`](https://github.com/kornelski/cargo-deb):
+
+```bash
+cargo install --locked cargo-deb            # one-time
+cd codex-rs
+cargo deb -p codex-desktop --features gtk
+ls -lh target/debian/codex-desktop_*_amd64.deb
+```
+
+The resulting `.deb` lands at `target/debian/codex-desktop_<version>_amd64.deb`
+and ships the following file layout (`dpkg-deb --contents`):
+
+```
+./
+./usr/
+./usr/bin/
+./usr/bin/codex-desktop
+./usr/libexec/
+./usr/libexec/codex-desktop/
+./usr/libexec/codex-desktop/codex-agent
+./usr/libexec/codex-desktop/codex-lspd
+./usr/share/
+./usr/share/applications/
+./usr/share/applications/dev.codex.Desktop.desktop
+./usr/share/doc/
+./usr/share/doc/codex-desktop/
+./usr/share/doc/codex-desktop/README.md
+./usr/share/doc/codex-desktop/architecture.md
+./usr/share/doc/codex-desktop/changelog.gz
+./usr/share/doc/codex-desktop/copyright
+./usr/share/icons/
+./usr/share/icons/hicolor/
+./usr/share/icons/hicolor/scalable/
+./usr/share/icons/hicolor/scalable/apps/
+./usr/share/icons/hicolor/scalable/apps/dev.codex.Desktop.svg
+./usr/share/metainfo/
+./usr/share/metainfo/dev.codex.Desktop.metainfo.xml
+```
+
+`/usr/libexec/codex-desktop/codex-agent` and `…/codex-lspd` are tiny shell
+shims that `exec -a <basename> /usr/bin/codex-desktop "$@"`, preserving the
+argv[0] multiplex when the package is installed to a system that doesn't
+allow same-binary symlinks across deb extraction.
+
+The `postinst` / `postrm` maintainer scripts refresh the GTK icon cache and
+the `update-desktop-database` mime cache when those tools are present.
