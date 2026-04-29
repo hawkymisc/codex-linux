@@ -5,14 +5,39 @@ Linux-native Agentic IDE that wraps the Codex CLI agent (and, optionally,
 Claude Code) behind a libadwaita GUI. It is the convergent finalist plan
 from a 10-iteration design synthesis.
 
-> Status: **PR-A through PR-E landed**. Scaffolding, NDJSON JSON-RPC
-> framing, agent-role server, ProcessBackend, conformance-suite skeleton,
-> WAL writer, GTK4+libadwaita main window, CodexBackend, markdown→widget
-> renderer, and an `AgentBridge` that spawns the in-tree binary in
-> `codex-agent` role and pipes events into the chat pane. The Send button
-> in the chat composer triggers a real round-trip; the agent's reply
-> lands as an assistant `MessageBlock` in the GtkColumnView. See
-> "Phased delivery" below for what's still to come.
+> Status: **PR-A through PR-T landed**. The IDE skeleton is now usable:
+>
+> * `codex-desktop` (4.2 MB release binary, 1.4 MB headless) launches an
+>   AdwApplicationWindow with sidebar + GtkSourceView editor tabs +
+>   virtualised GtkColumnView chat + AdwHeaderBar status pill.
+> * `codex-agent` role: NDJSON JSON-RPC server speaking the protocol-
+>   compatible subset (initialize / submit / interrupt / shutdown), with
+>   streaming `agent/message_delta` + `agent/turn_completed`.
+> * `codex-lspd` role: NDJSON dispatch + LSP `Content-Length:` framing
+>   + opt-in real `rust-analyzer` spawn + initialize round-trip.
+> * `AgentBridge` spawns the in-tree binary as a `codex-agent` child
+>   via `arg0`-multiplex, drives Send → submit → streaming reply →
+>   markdown rendering via `IncrementalParser`. Status pill flips
+>   Idle / Thinking / Disconnected from the bridge events.
+> * Crash-recovery WAL: append-only CBOR + CRC-32C, fdatasync at
+>   TurnCompleted / ApprovalDecision boundaries.
+> * Distribution: 770 KB `.deb` (cargo-deb), 38 MB AppImage
+>   (linuxdeploy + linuxdeploy-plugin-gtk + appimagetool), Flatpak
+>   manifest targeting `org.gnome.Platform//46`.
+> * Theme follow via `xdg-desktop-portal` (`org.freedesktop.appearance`)
+>   color-scheme + accent-color.
+> * Command palette (Ctrl+P / Ctrl+Shift+P): file picker + named
+>   commands incl. Toggle Vim Mode.
+> * Vim mode: `sourceview5::VimIMContext` swappable per editor tab.
+> * Streaming markdown rendering: `IncrementalParser::push(delta)` runs
+>   in O(Δ); chat widgets refresh through `md_to_widgets::block_to_
+>   widget` so users see bold/code/lists growing in real time.
+>
+> Quality: ~180 tests green, clippy zero warnings, real `rust-analyzer
+> 1.93.0` initialise round-trip green, AppImage runs out-of-the-box on
+> Ubuntu 22.04+ with libgtk-4-1 / libadwaita-1-0 / libgtksourceview-5-0.
+> See "Phased delivery" below for PR-U+ (real LSP didChange/diagnostics
+> traffic, in-process Codex via codex-app-server-client, gettext, …).
 
 ## 1. Goals & non-goals
 
