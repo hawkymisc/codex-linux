@@ -13,6 +13,7 @@
 pub mod agent_role;
 pub mod role;
 pub mod run;
+pub mod wal;
 
 #[cfg(feature = "gtk")]
 pub mod gui;

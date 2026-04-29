@@ -25,6 +25,7 @@ gtk = ["dep:gtk4", "dep:libadwaita", "dep:sourceview5"]
 
 [dependencies]
 anyhow = { workspace = true }
+ciborium = "0.2"
 clap = { workspace = true, features = ["derive"] }
 codex-agent-backend = { path = "../agent-backend" }
 codex-jsonrpc-framing = { path = "../jsonrpc-framing" }
@@ -43,3 +44,4 @@ sourceview5 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
