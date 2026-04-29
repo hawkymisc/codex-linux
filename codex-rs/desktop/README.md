@@ -143,23 +143,87 @@ The script:
    release binary at `usr/bin/codex-desktop`, the `.desktop` and SVG icon
    under `usr/share/{applications,icons,metainfo}/`, the arg0 shim shells
    under `usr/libexec/codex-desktop/`, and top-level `dev.codex.Desktop.{desktop,svg}`
-   plus the `AppRun` entrypoint.
-3. Downloads `linuxdeploy-x86_64.AppImage` and `linuxdeploy-plugin-gtk.sh`
-   (cached under `codex-rs/target/appimage-tools/`) on first run.
-4. Invokes `linuxdeploy --appdir AppDir --plugin gtk --output appimage`,
-   producing `codex-rs/target/appimage/Codex-Desktop-x86_64.AppImage`.
+   plus the bash `AppRun` entrypoint.
+3. Downloads `linuxdeploy-x86_64.AppImage`, `linuxdeploy-plugin-gtk.sh`,
+   and `appimagetool-x86_64.AppImage` (all cached under
+   `codex-rs/target/appimage-tools/`) on first run.
+4. Builds the AppImage in three phases:
+
+   - **Phase A** — `linuxdeploy --plugin gtk` bundles GTK4 / libadwaita /
+     GtkSourceView / their transitive deps under `usr/lib/` with
+     `rpath=$ORIGIN`, installs the GTK env-setup hook
+     (`apprun-hooks/linuxdeploy-plugin-gtk.sh`), and renames our AppRun
+     to `AppRun.wrapped` while writing its own outer AppRun that sources
+     the hook and execs the wrapped one.
+   - **Phase B** — patches the plugin's outer AppRun in place so the
+     trailing `exec "$this_dir"/AppRun.wrapped "$@"` becomes
+     `exec -a "$(basename "$0")" "$this_dir"/AppRun.wrapped "$@"`. That
+     keeps the GTK env hook on the path *and* preserves argv[0] for the
+     codex-desktop / codex-agent / codex-lspd multiplex.
+   - **Phase C** — `appimagetool AppDir → Codex-Desktop-x86_64.AppImage`
+     seals the bundle. We run appimagetool directly (rather than letting
+     linuxdeploy do it) because every `linuxdeploy --output appimage` run
+     re-executes the GTK plugin and overwrites the outer AppRun — which
+     would clobber the Phase B patch.
 
 The script auto-detects missing `libfuse2` and exports
-`APPIMAGE_EXTRACT_AND_RUN=1` so the linuxdeploy and gtk-plugin AppImages
-self-extract — no FUSE required for the build itself. The produced
-AppImage may still need `libfuse2` to run on the user's machine; on hosts
-without FUSE invoke it as `./Codex-Desktop-x86_64.AppImage --appimage-extract-and-run`.
+`APPIMAGE_EXTRACT_AND_RUN=1` so the linuxdeploy / appimagetool /
+gtk-plugin AppImages self-extract during the build — no FUSE required
+on the build host. The produced AppImage may still need `libfuse2` to
+mount itself at runtime on the *user's* machine; on hosts without FUSE
+it can be invoked as
+`./Codex-Desktop-x86_64.AppImage --appimage-extract-and-run`.
 
-If the build host lacks `libfuse2` and the linuxdeploy AppImages cannot
-self-extract either, run only steps 1–2 of the script (which leave the
-AppDir staged on disk) and finalise the bundle on a machine with
-`libfuse2`:
+If neither `libfuse2` nor self-extraction work on a build host, run
+only steps 1–2 of the script (which leave the AppDir staged on disk)
+and finalise the bundle on a machine with `libfuse2`:
 
 ```bash
-linuxdeploy --appdir codex-rs/target/appimage/AppDir --plugin gtk --output appimage
+linuxdeploy --appdir codex-rs/target/appimage/AppDir --plugin gtk
+# patch AppDir/AppRun's trailing exec to add `-a "$(basename "$0")"`
+appimagetool codex-rs/target/appimage/AppDir \
+             codex-rs/target/appimage/Codex-Desktop-x86_64.AppImage
 ```
+
+### Flatpak
+
+```bash
+sudo apt install flatpak flatpak-builder
+flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+bash codex-rs/desktop/packaging/flatpak/build-flatpak.sh
+flatpak run dev.codex.Desktop
+```
+
+The manifest (`codex-rs/desktop/packaging/flatpak/dev.codex.Desktop.yml`)
+targets the GNOME 46 runtime — the same GTK4 4.14 + libadwaita 1.5 +
+GtkSourceView 5 stack that ships in Ubuntu 24.04 — and pulls the Rust
+toolchain from `org.freedesktop.Sdk.Extension.rust-stable//24.08`. The
+`build-flatpak.sh` helper installs the runtimes from Flathub, then
+invokes `flatpak-builder --user --install` so the resulting bundle lands
+in the calling user's installation.
+
+Sandbox permissions (`finish-args`):
+
+| Permission | Why |
+|---|---|
+| `--socket=wayland`, `--socket=fallback-x11`, `--device=dri` | GTK4 rendering. |
+| `--share=network` | LLM API access. |
+| `--share=ipc` | shared memory + GTK shm fallbacks. |
+| `--filesystem=home` | edit user files; tighten with portals once ashpd file-chooser lands. |
+| `--talk-name=org.freedesktop.portal.*` | xdg-desktop-portal (file-chooser, secrets, notifications). |
+| `--talk-name=org.freedesktop.secrets` | libsecret keyring for API tokens. |
+| `--socket=fcitx`, `--env=GTK_IM_MODULE=fcitx` | IME passthrough for CJK/IME users. |
+| `--env=PATH=/app/bin:/usr/bin` | so the `codex-agent` arg0 multiplex shim resolves inside the bubble. |
+
+**Caveats / v2 work**
+
+- The first-cut manifest does **not** vendor cargo registry sources, so
+  `flatpak-builder` must be invoked with network access during the
+  build (the default on most flatpak-builder versions). Production
+  builds should run `flatpak-cargo-generator.py` against
+  `codex-rs/Cargo.lock` and switch the `cargo build` invocation back to
+  `--offline`.
+- The `codex-linux-sandbox` inner sandbox is best-effort inside the
+  Flatpak bubblewrap layer — nested user-namespaces work on most modern
+  kernels but are not guaranteed. Security-conscious users should
+  prefer the `.deb` channel where the inner sandbox is unconstrained.

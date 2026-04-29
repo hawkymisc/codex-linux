@@ -91,6 +91,7 @@ install -m 755 "$DESKTOP_CRATE_ROOT/packaging/AppRun" "$APPDIR/AppRun"
 # ---------------------------------------------------------------------------
 LINUXDEPLOY="$TOOLS_DIR/linuxdeploy-x86_64.AppImage"
 LINUXDEPLOY_GTK="$TOOLS_DIR/linuxdeploy-plugin-gtk.sh"
+APPIMAGETOOL="$TOOLS_DIR/appimagetool-x86_64.AppImage"
 if [ ! -x "$LINUXDEPLOY" ]; then
   echo "==> Downloading linuxdeploy..."
   curl -fL -o "$LINUXDEPLOY" \
@@ -103,24 +104,35 @@ if [ ! -x "$LINUXDEPLOY_GTK" ]; then
     "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
   chmod +x "$LINUXDEPLOY_GTK"
 fi
+if [ ! -x "$APPIMAGETOOL" ]; then
+  echo "==> Downloading appimagetool..."
+  curl -fL -o "$APPIMAGETOOL" \
+    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+  chmod +x "$APPIMAGETOOL"
+fi
 
 # ---------------------------------------------------------------------------
-# 4. Run linuxdeploy in two phases so we can fix up the GTK plugin's AppRun
-#    before the AppImage is sealed.
+# 4. Build the AppImage in three phases.
 #
-# Phase A: linuxdeploy --plugin gtk (no --output) bundles GTK libs and writes
-# its own AppRun that sources `apprun-hooks/linuxdeploy-plugin-gtk.sh` (sets
-# GTK_PATH / GIO_MODULE_DIR / fontconfig / gdk-pixbuf loaders) and then execs
-# our original AppRun, renamed to `AppRun.wrapped`.
+# Phase A — linuxdeploy --plugin gtk (no --output):
+#   bundles GTK4 / libadwaita / GtkSourceView / their transitive deps into
+#   $APPDIR/usr/lib (with rpath=$ORIGIN), drops the
+#   `apprun-hooks/linuxdeploy-plugin-gtk.sh` env-setup hook, and writes its
+#   own outer AppRun that sources the hook and execs $APPDIR/AppRun.wrapped
+#   (our original argv[0]-preserving AppRun, renamed in place).
 #
-# Phase B: We patch the plugin's outer AppRun so its trailing
-#   exec "$this_dir"/AppRun.wrapped "$@"
-# becomes
-#   exec -a "$(basename "$0")" "$this_dir"/AppRun.wrapped "$@"
-# which is what makes argv[0] arrive at our AppRun.wrapped intact (so symlinks
-# named codex-agent / codex-lspd dispatch to the right role).
+# Phase B — patch the plugin's outer AppRun in place:
+#   linuxdeploy-plugin-gtk's AppRun ends with
+#     exec "$this_dir"/AppRun.wrapped "$@"
+#   which loses argv[0]. We rewrite it to
+#     exec -a "$(basename "$0")" "$this_dir"/AppRun.wrapped "$@"
+#   so symlinks named codex-agent / codex-lspd that point at the AppImage
+#   dispatch to the right role. We do this BEFORE sealing the AppImage,
+#   and we run appimagetool directly so linuxdeploy's GTK plugin doesn't
+#   re-execute and clobber our patch (it does that on every linuxdeploy run).
 #
-# Phase C: linuxdeploy --output appimage seals the AppDir into the .AppImage.
+# Phase C — appimagetool $APPDIR -> $OUTPUT_APPIMAGE:
+#   plain squashfs + AppImage runtime ELF. No re-running of linuxdeploy.
 # ---------------------------------------------------------------------------
 export PATH="$TOOLS_DIR:$PATH"
 OUTPUT_APPIMAGE="$OUT_DIR/Codex-Desktop-x86_64.AppImage"
@@ -138,14 +150,18 @@ if [ -f "$APPDIR/AppRun.wrapped" ] && [ -f "$PLUGIN_APPRUN" ]; then
   sed -i \
     -e 's|^exec "$this_dir"/AppRun\.wrapped "$@"$|exec -a "$(basename "$0")" "$this_dir"/AppRun.wrapped "$@"|' \
     "$PLUGIN_APPRUN"
+else
+  echo "WARNING: linuxdeploy-plugin-gtk did not produce AppRun.wrapped; the" \
+       "argv[0]-preserving entrypoint is still in place but GTK env hooks" \
+       "are not chained." >&2
 fi
 
-echo "==> Phase C: linuxdeploy --output appimage (seal the AppImage)..."
+echo "==> Phase C: appimagetool seals AppDir -> $OUTPUT_APPIMAGE..."
+rm -f "$OUTPUT_APPIMAGE"
 (
   cd "$OUT_DIR"
   ARCH=x86_64 \
-  OUTPUT="$OUTPUT_APPIMAGE" \
-  "$LINUXDEPLOY" --appdir "$APPDIR" --output appimage
+  "$APPIMAGETOOL" "$APPDIR" "$OUTPUT_APPIMAGE"
 )
 
 ls -lh "$OUTPUT_APPIMAGE"
