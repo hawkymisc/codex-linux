@@ -2,6 +2,7 @@
 members = [
     "aws-auth",
     "analytics",
+    "agent-backend",
     "agent-identity",
     "backend-client",
     "ansi-escape",
@@ -26,6 +27,7 @@ members = [
     "collaboration-mode-templates",
     "connectors",
     "config",
+    "desktop",
     "device-key",
     "shell-command",
     "shell-escalation",
@@ -40,11 +42,13 @@ members = [
     "exec-server",
     "execpolicy",
     "execpolicy-legacy",
+    "jsonrpc-framing",
     "keyring-store",
     "file-search",
     "linux-sandbox",
     "lmstudio",
     "login",
+    "markdown-ast",
     "codex-mcp",
     "mcp-server",
     "memories/read",
@@ -115,6 +119,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Internal
 app_test_support = { path = "app-server/tests/common" }
+codex-agent-backend = { path = "agent-backend" }
 codex-analytics = { path = "analytics" }
 codex-agent-identity = { path = "agent-identity" }
 codex-ansi-escape = { path = "ansi-escape" }
@@ -141,6 +146,7 @@ codex-connectors = { path = "connectors" }
 codex-core = { path = "core" }
 codex-core-plugins = { path = "core-plugins" }
 codex-core-skills = { path = "core-skills" }
+codex-desktop = { path = "desktop" }
 codex-device-key = { path = "device-key" }
 codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
@@ -150,6 +156,7 @@ codex-experimental-api-macros = { path = "codex-experimental-api-macros" }
 codex-features = { path = "features" }
 codex-feedback = { path = "feedback" }
 codex-install-context = { path = "install-context" }
+codex-jsonrpc-framing = { path = "jsonrpc-framing" }
 codex-file-search = { path = "file-search" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
@@ -157,6 +164,7 @@ codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
+codex-markdown-ast = { path = "markdown-ast" }
 codex-memories-read = { path = "memories/read" }
 codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }
