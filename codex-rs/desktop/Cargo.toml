@@ -21,7 +21,7 @@ default = []
 # so the workspace builds in environments without GTK development headers
 # (CI that lacks libgtk-4-dev / libadwaita-1-dev). The Linux distribution
 # packages (.deb, AppImage, Flatpak) all build with `--features gtk`.
-gtk = ["dep:gtk4", "dep:libadwaita", "dep:sourceview5"]
+gtk = ["dep:gtk", "dep:adw", "dep:sourceview5", "dep:glib"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -29,7 +29,7 @@ ciborium = "0.2"
 clap = { workspace = true, features = ["derive"] }
 codex-agent-backend = { path = "../agent-backend" }
 codex-jsonrpc-framing = { path = "../jsonrpc-framing" }
-codex-markdown-ast = { path = "../markdown-ast" }
+codex-markdown-ast = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -38,9 +38,26 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 # GTK stack — optional, gated by the `gtk` feature.
-gtk4 = { version = "0.9", optional = true }
-libadwaita = { version = "0.7", optional = true }
-sourceview5 = { version = "0.9", optional = true }
+[dependencies.gtk]
+package = "gtk4"
+version = "0.9"
+optional = true
+features = ["v4_12"]
+
+[dependencies.adw]
+package = "libadwaita"
+version = "0.7"
+optional = true
+features = ["v1_5"]
+
+[dependencies.sourceview5]
+version = "0.9"
+optional = true
+features = ["v5_10"]
+
+[dependencies.glib]
+version = "0.20"
+optional = true
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

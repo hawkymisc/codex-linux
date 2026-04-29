@@ -17,7 +17,9 @@ async fn run_desktop() -> Result<()> {
 
     #[cfg(feature = "gtk")]
     {
-        crate::gui::run_main_window().await
+        // GTK's main loop is blocking, so run it on a dedicated blocking
+        // thread to keep the tokio runtime usable.
+        tokio::task::spawn_blocking(crate::gui::run_main_window).await?
     }
 
     #[cfg(not(feature = "gtk"))]

@@ -84,7 +84,7 @@ inventory::collect!(BackendDescriptor);
 /// change between builds; UIs that need a stable order should sort by
 /// [`BackendDescriptor::display_name`] or [`BackendDescriptor::id`].
 pub fn registered_backends() -> impl Iterator<Item = &'static BackendDescriptor> {
-    inventory::iter::<BackendDescriptor>().into_iter()
+    inventory::iter::<BackendDescriptor>()
 }
 
 #[cfg(test)]

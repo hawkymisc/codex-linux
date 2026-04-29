@@ -161,6 +161,14 @@ impl ProcessBackend {
     }
 
     /// Send a JSON-RPC request and await its matching response.
+    ///
+    /// We hold the [`tokio::sync::Mutex`] guard across the inner
+    /// `write_message` future so concurrent callers cannot interleave bytes
+    /// mid-frame; the workspace's `clippy::await_holding_invalid_type` lint
+    /// flags this pattern as risky in general but it is intentional here —
+    /// the contended region is a single NDJSON line write whose duration is
+    /// bounded by stdin pipe capacity.
+    #[allow(clippy::await_holding_invalid_type)]
     async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
         let id = self.next_request_id().await;
         let (tx, rx) = oneshot::channel();
@@ -281,8 +289,14 @@ impl AgentBackend for ProcessBackend {
         Ok(())
     }
 
+    #[allow(clippy::await_holding_invalid_type)]
     async fn shutdown(self: Box<Self>) -> Result<(), BackendError> {
-        // Best-effort RPC shutdown. Then ensure the child is reaped.
+        // Best-effort RPC shutdown. Then ensure the child is reaped. The
+        // workspace's `clippy::await_holding_invalid_type` lint flags
+        // holding the child mutex across `kill().await` / `wait().await`,
+        // but releasing it would let a concurrent shutdown race on the same
+        // child handle; the contention window is microseconds (single-shot
+        // teardown) so the trade is fine.
         let _ = self.request("shutdown", Value::Null).await;
         if let Some(mut child) = self.child.lock().await.take() {
             let _ = child.kill().await;
@@ -437,6 +451,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real subprocess; run with --ignored"]
+    #[allow(clippy::await_holding_invalid_type)]
     async fn cat_echoes_response_with_unknown_id_warns_but_does_not_break() {
         // `cat` simply replays what we write. We send something that
         // looks like a JSON-RPC response — there is no pending request

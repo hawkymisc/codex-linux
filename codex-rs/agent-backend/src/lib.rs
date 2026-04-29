@@ -27,6 +27,7 @@
 //!   Claude Code adapter.
 
 pub mod capabilities;
+pub mod codex;
 pub mod envelope;
 pub mod error;
 pub mod process;
@@ -34,6 +35,7 @@ pub mod registry;
 pub mod types;
 
 pub use capabilities::BackendCapabilities;
+pub use codex::CodexBackend;
 pub use envelope::{IncomingServerNotification, KnownNotification, KnownVariantRegistry, UnknownNotification};
 pub use error::BackendError;
 pub use process::{ProcessBackend, ProcessBackendConfig};
