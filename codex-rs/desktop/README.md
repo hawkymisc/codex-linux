@@ -121,3 +121,45 @@ allow same-binary symlinks across deb extraction.
 
 The `postinst` / `postrm` maintainer scripts refresh the GTK icon cache and
 the `update-desktop-database` mime cache when those tools are present.
+
+### AppImage
+
+A portable AppImage that bundles GTK4 + libadwaita + GtkSourceView via
+`linuxdeploy-plugin-gtk`. The output runs on Ubuntu 22.04+ without
+`libgtk-4-dev` / `libadwaita-1-dev` / `libgtksourceview-5-dev` installed.
+
+```bash
+sudo apt install libfuse2t64                           # for runtime FUSE
+codex-rs/desktop/packaging/build-appimage.sh
+ls -lh codex-rs/target/appimage/Codex-Desktop-*.AppImage
+chmod +x codex-rs/target/appimage/Codex-Desktop-x86_64.AppImage
+./codex-rs/target/appimage/Codex-Desktop-x86_64.AppImage   # opens the GUI
+```
+
+The script:
+
+1. Builds `cargo build --release -p codex-desktop --features gtk`.
+2. Stages an `AppDir` at `codex-rs/target/appimage/AppDir/` with the
+   release binary at `usr/bin/codex-desktop`, the `.desktop` and SVG icon
+   under `usr/share/{applications,icons,metainfo}/`, the arg0 shim shells
+   under `usr/libexec/codex-desktop/`, and top-level `dev.codex.Desktop.{desktop,svg}`
+   plus the `AppRun` entrypoint.
+3. Downloads `linuxdeploy-x86_64.AppImage` and `linuxdeploy-plugin-gtk.sh`
+   (cached under `codex-rs/target/appimage-tools/`) on first run.
+4. Invokes `linuxdeploy --appdir AppDir --plugin gtk --output appimage`,
+   producing `codex-rs/target/appimage/Codex-Desktop-x86_64.AppImage`.
+
+The script auto-detects missing `libfuse2` and exports
+`APPIMAGE_EXTRACT_AND_RUN=1` so the linuxdeploy and gtk-plugin AppImages
+self-extract — no FUSE required for the build itself. The produced
+AppImage may still need `libfuse2` to run on the user's machine; on hosts
+without FUSE invoke it as `./Codex-Desktop-x86_64.AppImage --appimage-extract-and-run`.
+
+If the build host lacks `libfuse2` and the linuxdeploy AppImages cannot
+self-extract either, run only steps 1–2 of the script (which leave the
+AppDir staged on disk) and finalise the bundle on a machine with
+`libfuse2`:
+
+```bash
+linuxdeploy --appdir codex-rs/target/appimage/AppDir --plugin gtk --output appimage
+```

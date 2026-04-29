@@ -47,6 +47,16 @@ const CODEX_CSS: &str = "
     border-top: 1px solid alpha(@borders, 0.6);
     padding: 6px;
 }
+.codex-agent-pill {
+    padding: 2px 8px;
+    border-radius: 9999px;
+    font-size: 0.85em;
+    margin-end: 6px;
+}
+.codex-agent-pill-idle    { color: @success_color; }
+.codex-agent-pill-thinking{ color: @accent_color;  }
+.codex-agent-pill-awaiting{ color: @warning_color; }
+.codex-agent-pill-disconnected { color: @error_color; }
 ";
 
 /// Install the global CSS provider and tell `AdwStyleManager` to follow

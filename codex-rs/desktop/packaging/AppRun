@@ -1,7 +1,13 @@
-#!/bin/sh
-# AppImage entrypoint. Preserves argv[0] for the arg0 multiplex so
-# helper invocations like `Codex.AppImage codex-agent < ndjson` route
-# to the right role inside the bundle.
+#!/usr/bin/env bash
+# AppImage entrypoint — codex-desktop arg0 multiplex.
+# Preserves argv[0] so helper invocations like
+# `Codex.AppImage codex-agent < ndjson` (or symlinks named
+# codex-agent / codex-lspd pointing at the AppImage) route to the
+# right role inside the bundle.
+#
+# Requires bash because we use the `exec -a NAME PROG ARGS...`
+# form to set the child's argv[0], which is a bash builtin and
+# is not portable to /bin/sh / dash.
 
 HERE="$(dirname "$(readlink -f "$0")")"
 export LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH:-}"

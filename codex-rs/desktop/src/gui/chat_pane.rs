@@ -95,6 +95,11 @@ impl Default for MessageBlock {
 /// install the bridge after construction.
 pub type SubmitCallback = Rc<dyn Fn(String) + 'static>;
 
+/// Callback invoked by [`ChatPane::show_agent_disconnected`] so the host
+/// window can surface UI affordances (e.g. an `AdwToast`) on top of the
+/// in-transcript system message that the chat pane appends itself.
+pub(crate) type AgentClosedCallback = Box<dyn Fn() + 'static>;
+
 /// The chat pane widget. Holds the backing `GListStore` and exposes
 /// helpers for appending messages.
 #[derive(Clone)]
@@ -107,6 +112,11 @@ pub struct ChatPane {
     /// `None` until then, in which case the Send button only adds the
     /// user message locally without invoking any backend.
     submit_cb: Rc<RefCell<Option<SubmitCallback>>>,
+    /// Optional host-window hook fired from
+    /// [`ChatPane::show_agent_disconnected`]. Used by `MainWindow` to
+    /// raise an `AdwToast`; if unset the pane simply appends the
+    /// in-transcript system message and moves on.
+    agent_closed_cb: Rc<RefCell<Option<Rc<AgentClosedCallback>>>>,
 }
 
 impl ChatPane {
@@ -300,6 +310,7 @@ impl ChatPane {
             store,
             composer,
             submit_cb: Rc::new(RefCell::new(None)),
+            agent_closed_cb: Rc::new(RefCell::new(None)),
         };
 
         // Wire the Send button to push the composer text into the chat.
@@ -446,9 +457,23 @@ impl ChatPane {
         });
     }
 
-    /// Append a system block stating that the agent has disconnected.
+    /// Install the agent-closed callback. Replaces any previously
+    /// installed callback. The host window uses this to raise an
+    /// `AdwToast` on top of the system message that the pane appends
+    /// from [`ChatPane::show_agent_disconnected`].
+    pub(crate) fn set_agent_closed_callback(&self, cb: AgentClosedCallback) {
+        *self.agent_closed_cb.borrow_mut() = Some(Rc::new(cb));
+    }
+
+    /// Append a system block stating that the agent has disconnected and
+    /// fire the host-window callback (if any) so the host can surface an
+    /// `AdwToast` with a Reconnect action.
     pub fn show_agent_disconnected(&self) {
         self.append_message("system", "Agent disconnected.");
+        let cb_opt = self.agent_closed_cb.borrow().as_ref().map(Rc::clone);
+        if let Some(cb) = cb_opt {
+            cb();
+        }
     }
 
     fn send_from_composer(&self) {

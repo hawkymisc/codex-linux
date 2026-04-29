@@ -60,7 +60,53 @@ pub struct MainWindow {
     /// Root container for the chat pane; we toggle its visibility via
     /// the command palette's `Toggle("chat-pane")` action.
     pub chat_root: gtk::Box,
+    /// Persistent agent-state pill living in the window's `AdwHeaderBar`.
+    /// Updated from the `BridgeEvent` drain loop via
+    /// [`set_pill_state`].
+    pub status_pill: gtk::Label,
     pub state: Rc<RefCell<AppState>>,
+}
+
+/// High-level agent-state buckets that drive the `status_pill` label and
+/// CSS class. Kept tiny on purpose: the `BridgeEvent` loop maps directly
+/// into one of these on every event.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AgentState {
+    Idle,
+    Thinking,
+    /// Reserved for the upcoming approval-prompt flow (PR-S2): the
+    /// `BridgeEvent` set does not yet include an approval signal, so
+    /// `Awaiting` is currently driven only by tests. Suppress the
+    /// dead-code lint so a release build with `-D warnings` stays clean.
+    #[allow(dead_code)]
+    Awaiting,
+    Disconnected,
+}
+
+const PILL_STATE_CLASSES: [&str; 4] = [
+    "codex-agent-pill-idle",
+    "codex-agent-pill-thinking",
+    "codex-agent-pill-awaiting",
+    "codex-agent-pill-disconnected",
+];
+
+/// Apply `state` to a pill `Label`: rewrites the visible text and swaps
+/// the modifier CSS class. Always re-asserts the base
+/// `codex-agent-pill` class so callers can pass a freshly-constructed
+/// `Label` without pre-seeding it.
+pub(crate) fn set_pill_state(label: &gtk::Label, state: AgentState) {
+    let (text, css) = match state {
+        AgentState::Idle => ("\u{25CF} Idle", "codex-agent-pill-idle"),
+        AgentState::Thinking => ("\u{25CF} Thinking\u{2026}", "codex-agent-pill-thinking"),
+        AgentState::Awaiting => ("\u{25CF} Awaiting approval", "codex-agent-pill-awaiting"),
+        AgentState::Disconnected => ("\u{25CF} Disconnected", "codex-agent-pill-disconnected"),
+    };
+    label.set_label(text);
+    for c in PILL_STATE_CLASSES {
+        label.remove_css_class(c);
+    }
+    label.add_css_class("codex-agent-pill");
+    label.add_css_class(css);
 }
 
 impl MainWindow {
@@ -125,6 +171,21 @@ impl MainWindow {
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&split_view));
 
+        // Build the top-level `AdwHeaderBar` for the window. Hosts the
+        // persistent agent-state pill on the trailing edge.
+        let header_bar = adw::HeaderBar::new();
+        let status_pill = gtk::Label::builder()
+            .label("\u{25CF} Idle")
+            .css_classes(["codex-agent-pill", "codex-agent-pill-idle"])
+            .build();
+        header_bar.pack_end(&status_pill);
+
+        // Wrap the toast overlay with an `AdwToolbarView` so we can layer
+        // the header bar above the existing split view.
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&toast_overlay));
+
         // Breakpoint: collapse the sidebar at narrow widths.
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
@@ -134,7 +195,7 @@ impl MainWindow {
         breakpoint.add_setter(&split_view, "collapsed", Some(&true.into()));
         window.add_breakpoint(breakpoint);
 
-        window.set_content(Some(&toast_overlay));
+        window.set_content(Some(&toolbar_view));
 
         let command_palette = CommandPalette::new();
         command_palette.set_workspace(Some(cwd));
@@ -148,6 +209,7 @@ impl MainWindow {
             chat,
             command_palette,
             chat_root: chat_box,
+            status_pill,
             state,
         };
         main.wire_signals();
@@ -235,22 +297,48 @@ impl MainWindow {
             submit_bridge.submit(prompt);
         });
 
+        // Install the agent-closed callback so the chat pane can ask us
+        // to surface an `AdwToast` with a Reconnect action when
+        // `BridgeEvent::AgentClosed` fires.
+        let toast_overlay = self.toast_overlay.clone();
+        self.chat.set_agent_closed_callback(Box::new(move || {
+            let toast = adw::Toast::builder()
+                .title("Codex agent disconnected")
+                .button_label("Reconnect")
+                .timeout(0)
+                .priority(adw::ToastPriority::High)
+                .build();
+            // NOTE: real reconnect flow lands in PR-S2 — `AgentBridge`
+            // does not yet expose a `restart()` entry point. For v1 we
+            // log the request and dismiss the toast so the user knows
+            // the click was registered.
+            toast.connect_button_clicked(move |t| {
+                tracing::info!("gui: reconnect requested (no-op until PR-S2)");
+                t.dismiss();
+            });
+            toast_overlay.add_toast(toast);
+        }));
+
         // Drain the bridge's event channel from the GTK main loop. We
         // hold a weak reference to the chat pane so dropping the window
         // does not keep the receiver task alive forever.
         if let Some(mut events_rx) = bridge.take_events_rx() {
             let chat = self.chat.clone();
+            let pill = self.status_pill.clone();
             glib::MainContext::default().spawn_local(async move {
                 while let Some(event) = events_rx.recv().await {
                     match event {
                         BridgeEvent::MessageDelta { text } => {
                             chat.start_or_extend_assistant_block(&text);
+                            set_pill_state(&pill, AgentState::Thinking);
                         }
                         BridgeEvent::TurnCompleted { stop_reason } => {
                             chat.finalise_assistant_block(&stop_reason);
+                            set_pill_state(&pill, AgentState::Idle);
                         }
                         BridgeEvent::AgentClosed => {
                             chat.show_agent_disconnected();
+                            set_pill_state(&pill, AgentState::Disconnected);
                         }
                     }
                 }
@@ -442,6 +530,7 @@ pub fn run_main_window(rt_handle: Handle) -> Result<()> {
 
 #[cfg(all(test, feature = "gtk"))]
 mod tests {
+    use adw::prelude::*;
     use std::sync::OnceLock;
 
     static INIT: OnceLock<bool> = OnceLock::new();
@@ -471,5 +560,56 @@ mod tests {
         let s = super::AppState::new(std::path::PathBuf::from("/tmp"));
         assert_eq!(s.workspace_root, std::path::PathBuf::from("/tmp"));
         assert!(s.open_tabs.is_empty());
+    }
+
+    #[test]
+    fn pill_initial_text_is_idle() {
+        if !ensure_gtk() {
+            return;
+        }
+        let label = gtk::Label::new(Some("\u{25CF} Idle"));
+        super::set_pill_state(&label, super::AgentState::Idle);
+        assert_eq!(label.text().to_string(), "\u{25CF} Idle");
+        assert!(label.css_classes().iter().any(|c| c == "codex-agent-pill"));
+        assert!(
+            label
+                .css_classes()
+                .iter()
+                .any(|c| c == "codex-agent-pill-idle")
+        );
+    }
+
+    #[test]
+    fn pill_transitions_through_states() {
+        if !ensure_gtk() {
+            return;
+        }
+        let label = gtk::Label::new(None);
+        for s in [
+            super::AgentState::Idle,
+            super::AgentState::Thinking,
+            super::AgentState::Awaiting,
+            super::AgentState::Disconnected,
+        ] {
+            super::set_pill_state(&label, s);
+        }
+        // Final state's CSS class should be the only state class.
+        assert!(
+            label
+                .css_classes()
+                .iter()
+                .any(|c| c == "codex-agent-pill-disconnected")
+        );
+        for stale in [
+            "codex-agent-pill-idle",
+            "codex-agent-pill-thinking",
+            "codex-agent-pill-awaiting",
+        ] {
+            assert!(
+                !label.css_classes().iter().any(|c| c.as_str() == stale),
+                "unexpected stale class {stale} present after final transition"
+            );
+        }
+        assert_eq!(label.text().to_string(), "\u{25CF} Disconnected");
     }
 }
