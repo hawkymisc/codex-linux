@@ -19,6 +19,11 @@ pub struct EditorPane {
     buffer: sourceview5::Buffer,
     label: gtk::Label,
     file_path: std::rc::Rc<std::cell::RefCell<Option<PathBuf>>>,
+    /// `EventControllerKey` whose `im_context` is swapped between
+    /// `VimIMContext` (vim mode) and `IMMulticontext` (default) by
+    /// [`EditorPane::set_vim_mode`].
+    vim_controller: gtk::EventControllerKey,
+    vim_enabled: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl EditorPane {
@@ -60,13 +65,49 @@ impl EditorPane {
             .build();
         root.append(&paned);
 
+        // Install a key controller on the view so we can swap its IM
+        // context between VimIMContext and the default multicontext at
+        // runtime via [`set_vim_mode`].
+        let vim_controller = gtk::EventControllerKey::new();
+        vim_controller.set_im_context(Some(&gtk::IMMulticontext::new()));
+        view.add_controller(vim_controller.clone());
+
         EditorPane {
             root,
             view,
             buffer,
             label,
             file_path: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            vim_controller,
+            vim_enabled: std::rc::Rc::new(std::cell::Cell::new(false)),
         }
+    }
+
+    /// Returns `true` if vim-style modal editing is currently active for
+    /// this pane.
+    pub fn vim_mode(&self) -> bool {
+        self.vim_enabled.get()
+    }
+
+    /// Enable or disable vim-style modal editing. When enabled, installs
+    /// a `sourceview5::VimIMContext` on the view's key controller; when
+    /// disabled, restores a plain `gtk::IMMulticontext`.
+    pub fn set_vim_mode(&self, enabled: bool) {
+        if enabled == self.vim_enabled.get() {
+            return;
+        }
+        if enabled {
+            let vim = sourceview5::VimIMContext::new();
+            // Connect the IM context to the view as required for cursor
+            // movement, scrolling, and the `:` command bar to function.
+            vim.set_client_widget(Some(&self.view));
+            self.vim_controller.set_im_context(Some(&vim));
+        } else {
+            self.vim_controller
+                .set_im_context(Some(&gtk::IMMulticontext::new()));
+        }
+        self.vim_enabled.set(enabled);
+        tracing::info!(enabled, "editor: vim mode toggled");
     }
 
     pub fn root(&self) -> &gtk::Box {

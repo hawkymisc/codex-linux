@@ -15,6 +15,8 @@ use tokio::runtime::Handle;
 use crate::agent_bridge::{AgentBridge, BridgeEvent};
 
 use super::chat_pane::ChatPane;
+use super::command_palette::CommandPalette;
+use super::command_palette::CommandPaletteAction;
 use super::editor_pane::EditorPane;
 use super::sidebar::Sidebar;
 use super::theme;
@@ -54,6 +56,10 @@ pub struct MainWindow {
     pub tab_view: adw::TabView,
     pub sidebar: Sidebar,
     pub chat: ChatPane,
+    pub command_palette: CommandPalette,
+    /// Root container for the chat pane; we toggle its visibility via
+    /// the command palette's `Toggle("chat-pane")` action.
+    pub chat_root: gtk::Box,
     pub state: Rc<RefCell<AppState>>,
 }
 
@@ -130,6 +136,9 @@ impl MainWindow {
 
         window.set_content(Some(&toast_overlay));
 
+        let command_palette = CommandPalette::new();
+        command_palette.set_workspace(Some(cwd));
+
         let main = MainWindow {
             window,
             toast_overlay,
@@ -137,16 +146,68 @@ impl MainWindow {
             tab_view,
             sidebar,
             chat,
+            command_palette,
+            chat_root: chat_box,
             state,
         };
         main.wire_signals();
         main.install_shortcuts();
+        main.wire_command_palette();
         main.wire_agent_bridge(rt_handle);
 
         // Open one empty editor tab by default.
         main.open_empty_tab();
 
         main
+    }
+
+    /// Wire the command palette's action callback to dispatch to the
+    /// appropriate handler on this window.
+    fn wire_command_palette(&self) {
+        let me = self.clone();
+        self.command_palette.set_action_callback(move |action| {
+            me.dispatch_palette_action(action);
+        });
+    }
+
+    fn dispatch_palette_action(&self, action: CommandPaletteAction) {
+        match action {
+            CommandPaletteAction::OpenFile(path) => {
+                if let Err(err) = self.open_file_tab(&path) {
+                    tracing::warn!(error = %err, path = %path.display(), "palette open_file failed");
+                    self.toast(&format!("Failed to open: {}", path.display()));
+                }
+            }
+            CommandPaletteAction::Toggle("vim-mode") => {
+                // Toggle on every open editor tab: a global toggle is
+                // friendlier than a per-tab one, especially when a tab
+                // is just opened from the palette.
+                let state = self.state.borrow();
+                let next = !state
+                    .open_tabs
+                    .iter()
+                    .any(super::editor_pane::EditorPane::vim_mode);
+                for editor in &state.open_tabs {
+                    editor.set_vim_mode(next);
+                }
+                drop(state);
+                self.toast(if next { "Vim mode: ON" } else { "Vim mode: OFF" });
+            }
+            CommandPaletteAction::Toggle("sidebar") => {
+                let split = &self.split_view;
+                split.set_show_sidebar(!split.shows_sidebar());
+            }
+            CommandPaletteAction::Toggle("chat-pane") => {
+                self.chat_root.set_visible(!self.chat_root.is_visible());
+            }
+            CommandPaletteAction::Toggle("quit") => {
+                self.window.close();
+            }
+            CommandPaletteAction::Toggle(other) => {
+                tracing::debug!(name = other, "palette: unknown toggle");
+            }
+            CommandPaletteAction::NoOp => {}
+        }
     }
 
     /// Spawn the agent bridge and route its events into the chat pane.
@@ -246,16 +307,26 @@ impl MainWindow {
             Some(open_dialog),
         ));
 
-        // Ctrl+Shift+P → reveal sidebar (placeholder for command palette).
+        // Ctrl+P → command palette in file-picker mode.
         let me = self.clone();
-        let reveal_sidebar = gtk::CallbackAction::new(move |_widget, _args| {
-            let split = &me.split_view;
-            split.set_show_sidebar(!split.shows_sidebar());
+        let palette_files = gtk::CallbackAction::new(move |_widget, _args| {
+            me.command_palette.open_files(&me.window);
+            glib::Propagation::Stop
+        });
+        controller.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Ctrl>p"),
+            Some(palette_files),
+        ));
+
+        // Ctrl+Shift+P → command palette in commands mode.
+        let me = self.clone();
+        let palette_commands = gtk::CallbackAction::new(move |_widget, _args| {
+            me.command_palette.open_commands(&me.window);
             glib::Propagation::Stop
         });
         controller.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string("<Ctrl><Shift>p"),
-            Some(reveal_sidebar),
+            Some(palette_commands),
         ));
 
         // F10 → toggle a placeholder menu (no-op toast for v0).
@@ -272,7 +343,9 @@ impl MainWindow {
         // Ctrl+? → shortcuts overlay (placeholder toast).
         let me = self.clone();
         let help = gtk::CallbackAction::new(move |_widget, _args| {
-            me.toast("Keyboard shortcuts: Ctrl+T open, Ctrl+W close, Ctrl+Shift+P sidebar");
+            me.toast(
+                "Keyboard shortcuts: Ctrl+T open, Ctrl+W close, Ctrl+P files, Ctrl+Shift+P commands",
+            );
             glib::Propagation::Stop
         });
         controller.add_shortcut(gtk::Shortcut::new(
@@ -353,6 +426,7 @@ pub fn run_main_window(rt_handle: Handle) -> Result<()> {
     app.connect_activate(move |app| {
         let main = MainWindow::build(app, rt_handle.clone());
         main.present();
+        crate::portal::install(&main.window);
     });
 
     // Pass an empty argv so GTK doesn't try to interpret the codex CLI's

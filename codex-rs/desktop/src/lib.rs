@@ -25,6 +25,9 @@ pub mod gui;
 #[cfg(feature = "gtk")]
 pub mod md_to_widgets;
 
+#[cfg(feature = "gtk")]
+pub mod portal;
+
 #[cfg(test)]
 mod tests {
     use crate::role::{Role, detect_role_from_argv0};

@@ -18,6 +18,7 @@
 
 pub mod app;
 pub mod chat_pane;
+pub mod command_palette;
 pub mod editor_pane;
 pub mod sidebar;
 pub mod theme;

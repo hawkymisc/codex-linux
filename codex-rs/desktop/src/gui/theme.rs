@@ -1,6 +1,10 @@
 #![cfg(feature = "gtk")]
 
 //! Theming: load the bundled `codex.css` and follow GNOME's color scheme.
+//!
+//! Live updates from the xdg-desktop-portal Settings interface are fed in
+//! via [`apply_theme`], which is invoked from the GTK main thread by the
+//! drain loop in [`crate::portal::install`].
 
 use gtk::gdk;
 
@@ -63,4 +67,41 @@ pub fn install() {
     // Follow the system light/dark preference.
     let style_manager = adw::StyleManager::default();
     style_manager.set_color_scheme(adw::ColorScheme::Default);
+}
+
+/// Apply a [`crate::portal::ThemeUpdate`] to the running app.
+///
+/// **GTK main thread only.** Mutates the global [`adw::StyleManager`]
+/// and (when an accent is provided) installs a CSS provider on the
+/// default `gdk::Display`. Calling this from a tokio worker is unsound
+/// — drain the channel from `glib::MainContext::default().spawn_local`.
+pub fn apply_theme(update: &crate::portal::ThemeUpdate) {
+    let manager = adw::StyleManager::default();
+    let scheme = match update.color_scheme {
+        crate::portal::ColorScheme::Dark => adw::ColorScheme::ForceDark,
+        crate::portal::ColorScheme::Light => adw::ColorScheme::ForceLight,
+        crate::portal::ColorScheme::NoPreference => adw::ColorScheme::Default,
+    };
+    manager.set_color_scheme(scheme);
+
+    // Accent color: stored as a CSS variable override via a CssProvider
+    // attached to the default display. The portal returns RGB in
+    // floating-point [0.0, 1.0]; libadwaita's CSS expects 0–255 ints.
+    if let Some((r, g, b)) = update.accent {
+        let css = format!(
+            "@define-color codex_accent rgb({r},{g},{b});\n",
+            r = (r * 255.0).round() as u8,
+            g = (g * 255.0).round() as u8,
+            b = (b * 255.0).round() as u8,
+        );
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(&css);
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_USER,
+            );
+        }
+    }
 }
