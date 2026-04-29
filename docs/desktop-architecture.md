@@ -5,8 +5,14 @@ Linux-native Agentic IDE that wraps the Codex CLI agent (and, optionally,
 Claude Code) behind a libadwaita GUI. It is the convergent finalist plan
 from a 10-iteration design synthesis.
 
-> Status: **plan + scaffolding landed (PR-A)**. The GUI itself is not yet
-> implemented. See "Phased delivery" below for the rollout schedule.
+> Status: **PR-A through PR-E landed**. Scaffolding, NDJSON JSON-RPC
+> framing, agent-role server, ProcessBackend, conformance-suite skeleton,
+> WAL writer, GTK4+libadwaita main window, CodexBackend, markdown→widget
+> renderer, and an `AgentBridge` that spawns the in-tree binary in
+> `codex-agent` role and pipes events into the chat pane. The Send button
+> in the chat composer triggers a real round-trip; the agent's reply
+> lands as an assistant `MessageBlock` in the GtkColumnView. See
+> "Phased delivery" below for what's still to come.
 
 ## 1. Goals & non-goals
 

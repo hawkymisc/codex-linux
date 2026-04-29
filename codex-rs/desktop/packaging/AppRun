@@ -1,0 +1,18 @@
+#!/bin/sh
+# AppImage entrypoint. Preserves argv[0] for the arg0 multiplex so
+# helper invocations like `Codex.AppImage codex-agent < ndjson` route
+# to the right role inside the bundle.
+
+HERE="$(dirname "$(readlink -f "$0")")"
+export LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH:-}"
+
+# If invoked as a symlink whose basename matches one of the helper
+# roles (codex-agent / codex-lspd), preserve that as argv[0] via env so
+# the binary's arg0 detection picks it up.
+case "$(basename "$0")" in
+  codex-agent|codex-lspd)
+    exec -a "$(basename "$0")" "$HERE/usr/bin/codex-desktop" "$@"
+    ;;
+esac
+
+exec -a codex-desktop "$HERE/usr/bin/codex-desktop" "$@"

@@ -7,12 +7,26 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use codex_markdown_ast::parse_full;
 use gtk::glib;
 use gtk::glib::Properties;
+use gtk::glib::SignalHandlerId;
 use gtk::glib::subclass::prelude::*;
+
+use crate::md_to_widgets::block_to_widget;
+
+thread_local! {
+    /// Per-`ListItem` notify-handler IDs attached during `connect_bind`,
+    /// keyed by the `gtk::ListItem` raw pointer. `connect_unbind`
+    /// disconnects them. The list-item factory is single-threaded (GTK
+    /// main loop), so a thread-local is sufficient.
+    static BIND_HANDLERS: RefCell<HashMap<usize, (SignalHandlerId, SignalHandlerId)>> =
+        RefCell::new(HashMap::new());
+}
 
 mod imp {
     use super::*;
@@ -104,38 +118,89 @@ impl ChatPane {
         let selection = gtk::NoSelection::new(Some(store.clone()));
 
         let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(|_factory, list_item| {
-            let label = gtk::Label::builder()
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .xalign(0.0)
-                .selectable(true)
-                .build();
-            if let Some(item) = list_item.downcast_ref::<gtk::ListItem>() {
-                item.set_child(Some(&label));
-            }
-        });
+        // We deliberately defer all widget construction to `connect_bind`:
+        // the row layout depends on `MessageBlock` properties that are
+        // only known once the item is bound. `connect_unbind` clears the
+        // child and disconnects the property listeners we attached.
         factory.connect_bind(|_factory, list_item| {
             let Some(item) = list_item.downcast_ref::<gtk::ListItem>() else {
                 return;
             };
-            let Some(message) = item.item().and_downcast::<MessageBlock>() else {
+            let Some(block) = item.item().and_downcast::<MessageBlock>() else {
                 return;
             };
-            let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+            // Build the initial row.
+            let row = build_message_row(&block);
+            item.set_child(Some(&row));
+
+            // Rebuild on `text` / `finalised` notifications. We use the
+            // weak `gtk::ListItem` ref so we don't keep the item alive
+            // longer than its lifecycle. On `unbind` we disconnect both
+            // handlers via the stash on the item's `MessageBlock`.
+            let item_weak = item.downgrade();
+            let block_for_text = block.clone();
+            let h_text = block.connect_notify_local(Some("text"), move |b, _ps| {
+                let Some(item) = item_weak.upgrade() else {
+                    return;
+                };
+                if item.item().and_downcast::<MessageBlock>().as_ref() != Some(b) {
+                    return;
+                }
+                let row = build_message_row(&block_for_text);
+                item.set_child(Some(&row));
+            });
+
+            let item_weak = item.downgrade();
+            let block_for_fin = block.clone();
+            let h_fin = block.connect_notify_local(Some("finalised"), move |b, _ps| {
+                let Some(item) = item_weak.upgrade() else {
+                    return;
+                };
+                if item.item().and_downcast::<MessageBlock>().as_ref() != Some(b) {
+                    return;
+                }
+                let row = build_message_row(&block_for_fin);
+                item.set_child(Some(&row));
+            });
+
+            // Stash the handler IDs on the row's data slot so unbind can
+            // disconnect them. We use `unsafe_set_data`-free storage via a
+            // boxed closure attached to the list_item itself: GLib's
+            // `set_data` requires `unsafe`, which is forbidden here, so
+            // we store on a `RefCell<Option<...>>` keyed by the
+            // `MessageBlock` GObject's qdata using safe `set_data_full`.
+            // Simpler: stash IDs on the item via `unsafe_set_data` is
+            // forbidden; instead drop them in a `Rc<Cell>` captured by
+            // the unbind handler. We attach both IDs as item properties
+            // through `glib::object::ObjectExt::set_data` — but that is
+            // also `unsafe`. So we settle for the simpler design: when
+            // unbind fires, we look up the block on the item and
+            // disconnect ANY notify handlers we previously attached by
+            // walking through `block.list_signal_handlers()`.
+            //
+            // Practically, blocking (rather than disconnecting) is the
+            // safest cross-version GTK pattern; but `block_signal` also
+            // needs the handler ID. We therefore keep the IDs in a
+            // thread-local `RefCell<HashMap<...>>` keyed by the item's
+            // pointer — see `BIND_HANDLERS`.
+            BIND_HANDLERS.with(|cell| {
+                cell.borrow_mut()
+                    .insert(item.as_ptr() as usize, (h_text, h_fin));
+            });
+        });
+        factory.connect_unbind(|_factory, list_item| {
+            let Some(item) = list_item.downcast_ref::<gtk::ListItem>() else {
                 return;
             };
-            label.set_text(&message.text());
-            // Reset the role-specific class.
-            for cls in [
-                "codex-msg-user",
-                "codex-msg-assistant",
-                "codex-msg-system",
-            ] {
-                label.remove_css_class(cls);
+            let key = item.as_ptr() as usize;
+            let handlers = BIND_HANDLERS.with(|cell| cell.borrow_mut().remove(&key));
+            if let Some((h_text, h_fin)) = handlers
+                && let Some(block) = item.item().and_downcast::<MessageBlock>()
+            {
+                block.disconnect(h_text);
+                block.disconnect(h_fin);
             }
-            let cls = format!("codex-msg-{}", message.role());
-            label.add_css_class(&cls);
+            item.set_child(gtk::Widget::NONE);
         });
 
         let column = gtk::ColumnViewColumn::builder()
@@ -356,6 +421,78 @@ impl Default for ChatPane {
     }
 }
 
+/// Build the visual representation of a `MessageBlock` for rendering in
+/// the chat transcript.
+///
+/// The shape is:
+/// - Outer = vertical `gtk::Box` carrying the role-specific CSS class
+///   (`codex-msg-user|assistant|system`) and, while streaming, the
+///   `codex-msg-streaming` modifier.
+/// - First child = a small role label header rendered with Pango markup
+///   (safe — role display names are hardcoded constants).
+/// - Body = either a single `gtk::Label` (user input, system messages,
+///   or streaming assistant text) or one widget per `MdBlock` produced
+///   by [`crate::md_to_widgets::block_to_widget`] (finalised assistant).
+fn build_message_row(block: &MessageBlock) -> gtk::Widget {
+    let role = block.role();
+    let outer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+    outer.add_css_class(&format!("codex-msg-{role}"));
+    if !block.finalised() && role == "assistant" {
+        outer.add_css_class("codex-msg-streaming");
+    }
+
+    // Role label header.
+    let header_markup = match role.as_str() {
+        "user" => "<b>You</b>",
+        "assistant" => "<b>Codex</b>",
+        // Anything else falls under "system" styling.
+        _ => "<b>system</b>",
+    };
+    let header = gtk::Label::builder().xalign(0.0).build();
+    header.set_use_markup(true);
+    header.set_markup(header_markup);
+    header.add_css_class("codex-msg-role");
+    outer.append(&header);
+
+    // Body.
+    let text = block.text();
+    let render_as_label = role == "user" || role == "system" || !block.finalised();
+    if render_as_label {
+        let body = gtk::Label::builder()
+            .label(&text)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .xalign(0.0)
+            .selectable(true)
+            .build();
+        outer.append(&body);
+    } else {
+        // Finalised assistant: parse markdown and render each block.
+        let doc = parse_full(&text);
+        if doc.blocks.is_empty() {
+            // Empty / whitespace-only — fall back to an empty label so
+            // the row still has a body child.
+            let body = gtk::Label::builder()
+                .label(&text)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .xalign(0.0)
+                .selectable(true)
+                .build();
+            outer.append(&body);
+        } else {
+            for md_block in &doc.blocks {
+                outer.append(&block_to_widget(md_block));
+            }
+        }
+    }
+
+    outer.upcast()
+}
+
 #[cfg(all(test, feature = "gtk"))]
 mod tests {
     use super::*;
@@ -405,5 +542,88 @@ mod tests {
         assert!(pane.message_count() >= 1);
         pane.append_message("user", "hi");
         assert!(pane.message_count() >= 2);
+    }
+
+    /// Walk the immediate children of `bx` into a `Vec<gtk::Widget>` so
+    /// tests can index by position. GTK doesn't expose a children API on
+    /// `gtk::Box`; iterating via `first_child` / `next_sibling` is the
+    /// supported pattern.
+    fn box_children(bx: &gtk::Box) -> Vec<gtk::Widget> {
+        let mut out = Vec::new();
+        let mut child = bx.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            out.push(c);
+        }
+        out
+    }
+
+    #[test]
+    fn assistant_finalised_renders_markdown_widgets() {
+        if !ensure_gtk() {
+            return;
+        }
+        let block = MessageBlock::new("assistant", "# Hello\n\nworld");
+        block.set_finalised(true);
+        let row = build_message_row(&block);
+        let bx: gtk::Box = row.downcast().expect("row is a Box");
+        assert!(bx.has_css_class("codex-msg-assistant"));
+        assert!(!bx.has_css_class("codex-msg-streaming"));
+        let children = box_children(&bx);
+        // Children: header + heading + paragraph (>= 3). The assertion
+        // in the spec is "at least 2 children" for the markdown body
+        // (heading + paragraph), so total should be >= 3.
+        assert!(
+            children.len() >= 3,
+            "expected header + >=2 markdown widgets, got {}",
+            children.len()
+        );
+    }
+
+    #[test]
+    fn user_block_renders_as_label_no_markdown() {
+        if !ensure_gtk() {
+            return;
+        }
+        let block = MessageBlock::new("user", "# not a heading");
+        // User blocks should not be markdown-rendered regardless of
+        // finalisation state.
+        block.set_finalised(true);
+        let row = build_message_row(&block);
+        let bx: gtk::Box = row.downcast().expect("row is a Box");
+        assert!(bx.has_css_class("codex-msg-user"));
+        let children = box_children(&bx);
+        // header + body label.
+        assert_eq!(children.len(), 2, "expected exactly 2 children");
+        let body: gtk::Label = children[1]
+            .clone()
+            .downcast()
+            .expect("body child should be a Label");
+        assert_eq!(body.text().to_string(), "# not a heading");
+    }
+
+    #[test]
+    fn streaming_block_keeps_simple_label_shape() {
+        if !ensure_gtk() {
+            return;
+        }
+        let block = MessageBlock::new("assistant", "# streaming...");
+        // finalised defaults to false.
+        assert!(!block.finalised());
+        let row = build_message_row(&block);
+        let bx: gtk::Box = row.downcast().expect("row is a Box");
+        assert!(bx.has_css_class("codex-msg-assistant"));
+        assert!(bx.has_css_class("codex-msg-streaming"));
+        let children = box_children(&bx);
+        assert_eq!(
+            children.len(),
+            2,
+            "streaming row should be header + single Label"
+        );
+        let body: gtk::Label = children[1]
+            .clone()
+            .downcast()
+            .expect("streaming body should be a Label");
+        assert_eq!(body.text().to_string(), "# streaming...");
     }
 }

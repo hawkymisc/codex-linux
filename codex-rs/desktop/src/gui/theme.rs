@@ -8,22 +8,33 @@ use gtk::gdk;
 /// styling comes from libadwaita.
 const CODEX_CSS: &str = "
 .codex-msg-user {
-    padding: 8px 10px;
-    border-radius: 6px;
+    padding: 12px;
+    margin: 8px;
+    border-radius: 8px;
     background-color: alpha(@accent_bg_color, 0.15);
     color: @window_fg_color;
 }
 .codex-msg-assistant {
-    padding: 8px 10px;
-    border-radius: 6px;
+    padding: 12px;
+    margin: 8px;
+    border-radius: 8px;
     background-color: alpha(@card_bg_color, 0.6);
     color: @window_fg_color;
 }
 .codex-msg-system {
-    padding: 6px 10px;
-    border-radius: 6px;
+    padding: 12px;
+    margin: 8px;
+    border-radius: 8px;
     color: alpha(@window_fg_color, 0.65);
     font-style: italic;
+}
+.codex-msg-streaming {
+    opacity: 0.85;
+}
+.codex-msg-role {
+    font-size: 0.85em;
+    opacity: 0.7;
+    margin-bottom: 2px;
 }
 .codex-streaming-tail {
     opacity: 0.6;

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Codex Desktop
+GenericName=AI Coding Agent
+Comment=Linux-native Agentic IDE wrapping the Codex CLI agent
+Categories=Development;IDE;TextEditor;
+Keywords=codex;ai;agent;coding;ide;editor;llm;
+Exec=codex-desktop %F
+Icon=dev.codex.Desktop
+Terminal=false
+StartupNotify=true
+StartupWMClass=dev.codex.Desktop
+MimeType=inode/directory;text/x-rust;text/x-python;text/x-c;text/x-c++;text/x-go;text/x-typescript;text/javascript;text/markdown;application/json;text/x-toml;text/x-yaml;text/x-shellscript;
+PrefersNonDefaultGPU=false
+SingleMainWindow=true
