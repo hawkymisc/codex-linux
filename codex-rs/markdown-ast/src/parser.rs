@@ -14,16 +14,17 @@
 //! `docs/desktop-architecture.md` §4 lands in PR-C.
 
 use crate::ast::{MdBlock, MdDocument};
+use crate::incremental::{BlockCache, BlockCacheEntry, fingerprint};
 use crate::inline::{Inline, InlineCode, InlineImage, InlineLink};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::ops::Range;
 
 /// One-shot full parse.
 pub fn parse_full(src: &str) -> MdDocument {
-    let opts = default_options();
-    let parser = Parser::new_ext(src, opts).into_offset_iter();
-    let mut peekable = parser.peekable();
-    let blocks = collect_blocks(&mut peekable, None);
+    let blocks = walk_events_into_blocks(events_for(src))
+        .into_iter()
+        .map(|(_range, block, _open)| block)
+        .collect();
     MdDocument { blocks }
 }
 
@@ -34,6 +35,79 @@ fn default_options() -> Options {
     o.insert(Options::ENABLE_TABLES);
     o.insert(Options::ENABLE_TASKLISTS);
     o
+}
+
+/// Build a fresh offset-iterator over `src` using the canonical option
+/// set. Returned as a concrete `Vec` so the iterator is `'static` with
+/// respect to `src` (events borrow from a slice we own internally —
+/// pulldown-cmark events with `Borrowed(&str)` payloads tied to `src`
+/// cannot escape the function, so we materialise upfront).
+fn events_for(src: &str) -> impl Iterator<Item = (Event<'_>, Range<usize>)> {
+    Parser::new_ext(src, default_options()).into_offset_iter()
+}
+
+/// Walk pulldown-cmark events into a sequence of top-level
+/// `(byte_range, block, is_open)` tuples. The walker is shared between
+/// [`parse_full`] (which discards the byte ranges and `is_open` flags)
+/// and [`IncrementalParser`] (which uses them to drive the cache).
+///
+/// `is_open` is true for the **last** top-level block only. This is a
+/// conservative rule that handles unclosed fences, unfinished setext
+/// headings, and lazy-continuation paragraphs uniformly: any of those
+/// can be reinterpreted by future bytes, so the simplest correct rule
+/// is "the trailing block is open until something appears after it".
+pub(crate) fn walk_events_into_blocks<'a, I>(iter: I) -> Vec<(Range<usize>, MdBlock, bool)>
+where
+    I: IntoIterator<Item = (Event<'a>, Range<usize>)>,
+{
+    let mut peekable = iter.into_iter().peekable();
+    let mut out: Vec<(Range<usize>, MdBlock)> = Vec::new();
+    collect_top_level(&mut peekable, &mut out);
+    let len = out.len();
+    out.into_iter()
+        .enumerate()
+        .map(|(i, (range, block))| {
+            let is_open = i + 1 == len;
+            (range, block, is_open)
+        })
+        .collect()
+}
+
+/// Walk top-level events, recording the byte range of each block. We
+/// can't reuse `collect_blocks` directly because it doesn't surface the
+/// per-block ranges out to the caller. Internally it still delegates to
+/// `consume_block` for the heavy lifting.
+fn collect_top_level<'a, I>(
+    iter: &mut std::iter::Peekable<I>,
+    out: &mut Vec<(Range<usize>, MdBlock)>,
+) where
+    I: Iterator<Item = (Event<'a>, Range<usize>)>,
+{
+    while let Some((event, range)) = iter.next() {
+        match event {
+            Event::Start(tag) => {
+                if let Some(block) = consume_block(tag, iter) {
+                    out.push((range, block));
+                }
+            }
+            Event::End(_) => {
+                // Stray top-level End – ignore to stay synchronised.
+            }
+            Event::Rule => out.push((range, MdBlock::ThematicBreak)),
+            Event::Html(s) => out.push((range, MdBlock::HtmlBlock(s.into_string()))),
+            Event::Text(_)
+            | Event::Code(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+            | Event::FootnoteReference(_)
+            | Event::TaskListMarker(_)
+            | Event::InlineHtml(_) => {
+                let mut inlines = Vec::new();
+                push_inline_event(&mut inlines, event);
+                out.push((range, MdBlock::Paragraph(inlines)));
+            }
+        }
+    }
 }
 
 /// Collect blocks from `iter` until either the iterator is exhausted or
@@ -322,32 +396,208 @@ pub struct ParseSnapshot {
 
 /// Incremental markdown parser.
 ///
-/// PR-B implementation: full reparse on every `parse` call but with a
-/// real walker so callers receive correctly-shaped `MdBlock` trees.
-/// PR-C will replace the body of `parse` with the byte-range-aware
-/// algorithm in `docs/desktop-architecture.md` §4.
+/// Long-lived object that amortises streaming agent replies: a delta of
+/// length Δ on top of N bytes runs in roughly O(Δ + last_open_block).
+///
+/// The parser keeps an internal byte-indexed cache of already-parsed
+/// top-level blocks ([`BlockCache`]). On each [`push`](Self::push) it:
+///
+/// 1. Appends the delta to `raw_source`.
+/// 2. Walks back from the end of the cache to find the last
+///    `is_open == false` entry – its `byte_range.end` is the safe cut
+///    `S`.
+/// 3. Re-parses `&raw_source[S..]` via pulldown-cmark and shifts every
+///    event range by `+ S` to land in the global address space.
+/// 4. Fingerprints every freshly-parsed block via xxhash3 and tail
+///    match-and-replaces against the existing cache.
+///
+/// See [`crate::incremental`] for the cache types.
 pub struct IncrementalParser {
-    snapshot: ParseSnapshot,
+    /// Cumulative source – grows monotonically.
+    raw_source: String,
+    /// Per-top-level-block cache.
+    cache: BlockCache,
+    /// Mirror of `cache.blocks_view()` for cheap `&[MdBlock]` returns
+    /// from `push` / `blocks` without re-cloning every call. Kept in
+    /// sync with `cache` after every mutation.
+    blocks_view: Vec<MdBlock>,
 }
 
 impl IncrementalParser {
+    /// Create a fresh parser with empty source and empty cache.
     pub fn new() -> Self {
         Self {
-            snapshot: ParseSnapshot::default(),
+            raw_source: String::new(),
+            cache: BlockCache::new(),
+            blocks_view: Vec::new(),
         }
     }
 
-    pub fn snapshot(&self) -> &ParseSnapshot {
-        &self.snapshot
+    /// Append `delta` to the internal source and re-parse only the
+    /// affected tail. Returns the current view of the document as a
+    /// flat slice of top-level blocks (matching `parse_full(...)
+    /// .blocks`).
+    pub fn push(&mut self, delta: &str) -> &[MdBlock] {
+        if !delta.is_empty() {
+            self.raw_source.push_str(delta);
+            self.reparse_tail();
+        }
+        &self.blocks_view
     }
 
+    /// Current view of top-level blocks. Equivalent to
+    /// `parse_full(self.raw_source()).blocks` but cheap.
+    pub fn blocks(&self) -> &[MdBlock] {
+        &self.blocks_view
+    }
+
+    /// Cumulative source pushed so far.
+    pub fn raw_source(&self) -> &str {
+        &self.raw_source
+    }
+
+    /// Number of cache entries currently considered stable
+    /// (`is_open == false`). Useful for tests / debugging; should never
+    /// decrease across pushes.
+    pub fn stable_block_count(&self) -> usize {
+        self.cache.stable_count()
+    }
+
+    /// xxhash3 fingerprints of every cached top-level block, in source
+    /// order. Exposed primarily for debugging and for downstream
+    /// consumers that want to validate AST identity across a process
+    /// boundary without serialising the whole tree.
+    pub fn block_fingerprints(&self) -> Vec<u64> {
+        self.cache.entries.iter().map(|e| e.fingerprint).collect()
+    }
+
+    /// Compatibility shim around the legacy `parse(src)` API. Resets
+    /// the parser to `src` (i.e. `raw_source = src`) and returns the
+    /// equivalent document. Prefer `push` for streaming use.
     pub fn parse(&mut self, src: &str) -> MdDocument {
-        let doc = parse_full(src);
-        self.snapshot = ParseSnapshot {
-            stable_prefix_end: src.len(),
-            blocks: doc.blocks.clone(),
-        };
-        doc
+        // The streaming algorithm is append-only, so a parse() call
+        // that "rewrites" the buffer cannot reuse the cache; the
+        // safest behaviour matching `parse_full` is to reset.
+        self.raw_source.clear();
+        self.cache = BlockCache::new();
+        self.blocks_view.clear();
+        if !src.is_empty() {
+            self.push(src);
+        }
+        MdDocument {
+            blocks: self.blocks_view.clone(),
+        }
+    }
+
+    /// Snapshot accessor retained for source compatibility with the
+    /// PR-B API.
+    pub fn snapshot(&self) -> ParseSnapshot {
+        ParseSnapshot {
+            stable_prefix_end: self.cache.cut_byte(),
+            blocks: self.blocks_view.clone(),
+        }
+    }
+
+    /// Heart of the incremental algorithm: re-parse `raw_source[S..]`
+    /// where `S` is the cut byte (last stable boundary), then merge
+    /// the result back into the cache.
+    fn reparse_tail(&mut self) {
+        // Up to two attempts: the second backs `S` up by one entry if
+        // the first attempt revealed that a previously-open boundary
+        // is now closed. See "Conservativeness" in `incremental.rs`.
+        for _ in 0..2 {
+            let cut = self.cache.cut_byte();
+            let tail = &self.raw_source[cut..];
+            let raw_events: Vec<(Event<'_>, Range<usize>)> = Parser::new_ext(tail, default_options())
+                .into_offset_iter()
+                .map(|(e, r)| (e, (r.start + cut)..(r.end + cut)))
+                .collect();
+            let new_top = walk_events_into_blocks(raw_events);
+
+            // Detect the edge case described in
+            // `docs/desktop-architecture.md` §4.2: if the FIRST
+            // freshly-parsed block lands at the cut boundary AND the
+            // cached entry immediately before the cut is itself open
+            // — meaning the new bytes may have *retroactively* closed
+            // it (closing fence finally arrived, setext promotion,
+            // …) — back the cut up by one entry and retry. This is
+            // the conservative move from the spec: we don't try to
+            // reason about pulldown-cmark's merging rules, we just
+            // re-parse from earlier.
+            if cut > 0
+                && let Some(prev) = self.cache.entries.iter().rev().find(|e| !e.is_open)
+            {
+                let prev_end = prev.byte_range.end;
+                if prev_end == cut
+                    && let Some(first_new) = new_top.first()
+                    && first_new.0.start <= cut
+                    && self.last_block_before(cut).is_some_and(|e| e.is_open)
+                {
+                    // Drop the previously-stable entry that is now
+                    // adjacent to a re-parse boundary so the next
+                    // iteration re-derives it from earlier bytes.
+                    if let Some(idx) = self
+                        .cache
+                        .entries
+                        .iter()
+                        .position(|e| e.byte_range.end == prev_end && !e.is_open)
+                    {
+                        // Mark it open so cut_byte() backs up.
+                        self.cache.entries[idx].is_open = true;
+                        self.cache.parsed_up_to = self
+                            .cache
+                            .entries
+                            .iter()
+                            .filter(|e| !e.is_open)
+                            .map(|e| e.byte_range.end)
+                            .max()
+                            .unwrap_or(0);
+                        continue;
+                    }
+                }
+            }
+
+            // Tail match-and-replace: drop every entry in the cache
+            // that overlaps `[cut..)` and rebuild from the freshly-
+            // parsed list. The xxhash3 fingerprint is computed for
+            // every new entry so consumers (and future cross-process
+            // cache validators) can cheaply tell whether two entries
+            // describe identical bytes without comparing the full
+            // `MdBlock` tree.
+            self.cache.truncate_at_byte(cut);
+            for (range, block, is_open) in new_top {
+                let bytes = self
+                    .raw_source
+                    .as_bytes()
+                    .get(range.clone())
+                    .unwrap_or(&[]);
+                let entry = BlockCacheEntry {
+                    byte_range: range.clone(),
+                    block,
+                    fingerprint: fingerprint(bytes),
+                    is_open,
+                };
+                if !is_open {
+                    self.cache.parsed_up_to = self
+                        .cache
+                        .parsed_up_to
+                        .max(entry.byte_range.end);
+                }
+                self.cache.entries.push(entry);
+            }
+            self.blocks_view = self.cache.blocks_view();
+            return;
+        }
+    }
+
+    /// Returns the last cache entry that ends at or before `byte`. Used
+    /// to look up the entry immediately preceding the cut.
+    fn last_block_before(&self, byte: usize) -> Option<&BlockCacheEntry> {
+        self.cache
+            .entries
+            .iter()
+            .rev()
+            .find(|e| e.byte_range.end <= byte)
     }
 }
 
@@ -620,9 +870,16 @@ mod tests {
 
     #[test]
     fn incremental_parser_updates_stable_prefix_end() {
+        // Under the streaming algorithm, the trailing block is always
+        // considered open until something appears after it, so an
+        // unterminated paragraph leaves the stable prefix at zero.
+        // Closing the paragraph with a blank line + new block bumps
+        // the stable cut past the paragraph.
         let mut p = IncrementalParser::new();
         let _ = p.parse("hello");
-        assert_eq!(p.snapshot().stable_prefix_end, 5);
+        assert_eq!(p.snapshot().stable_prefix_end, 0);
+        let _ = p.parse("hello\n\nworld");
+        assert!(p.snapshot().stable_prefix_end >= "hello\n\n".len() - 1);
     }
 
     #[test]

@@ -41,6 +41,7 @@
 //!   algorithm.
 
 pub mod ast;
+pub(crate) mod incremental;
 pub mod inline;
 pub mod parser;
 

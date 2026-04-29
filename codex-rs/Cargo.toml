@@ -405,6 +405,7 @@ which = "8"
 whoami = "1.6.1"
 wildmatch = "2.6.1"
 winapi-util = "0.1.11"
+xxhash-rust = "0.8"
 zip = "2.4.2"
 zstd = "0.13"
 
