@@ -30,9 +30,11 @@ use codex_agent_backend::{
     AgentBackend, ClientInfo, CodexBackend, IncomingServerNotification, InitializeParams,
     Submission, SubmissionId, ThreadId,
 };
+use codex_drift_log::DriftLog;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 use tokio::process::{Child, Command};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -183,6 +185,13 @@ fn resolve_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Default drift-log JSONL path under the user's state dir. Mirrors the
+/// `~/.local/state/codex-desktop/turns/...` layout used by the WAL so a
+/// future "diagnostic export" UI can grab both with one path prefix.
+fn default_drift_log_path(home: &std::path::Path) -> PathBuf {
+    home.join(".local/state/codex-desktop/drift-log.jsonl")
+}
+
 /// Recipe for spawning the agent child. Captured at construction time so
 /// [`AgentBridge::restart`] can rebuild the same `Command` after a crash
 /// without revisiting `current_exe()` (which can fail on systems where the
@@ -198,6 +207,10 @@ pub struct AgentCommand {
     /// Optional env overrides applied on each spawn. Used by integration
     /// tests to bake `CODEX_DESKTOP_FORCE_ROLE=agent` into the child env.
     pub envs: Vec<(String, String)>,
+    /// Override the drift-log JSONL path. Tests point this at a tempdir
+    /// so unrelated test runs don't share state under `~/.local/state/`.
+    /// `None` defaults to [`default_drift_log_path`].
+    pub drift_log_path: Option<PathBuf>,
 }
 
 impl AgentCommand {
@@ -212,6 +225,7 @@ impl AgentCommand {
             program,
             arg0: "codex-agent".to_string(),
             envs: Vec::new(),
+            drift_log_path: None,
         })
     }
 
@@ -257,6 +271,10 @@ pub struct AgentBridge {
     /// a [`std::sync::Mutex`] so [`Self::take_events_rx`] only takes the
     /// receiver once even if the bridge is shared.
     events_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BridgeEvent>>>,
+    /// Drift log shared across restarts. `None` if the file at
+    /// `cmd_spec.drift_log_path` (or the default path) could not be
+    /// opened — the bridge falls back to logging unknowns at warn level.
+    drift_log: Option<Arc<DriftLog>>,
     /// Replaceable per-supervisor state. Locked briefly on `submit()` to
     /// read the current `submit_tx`, and on `restart()` to swap.
     current: std::sync::Mutex<SupervisorSlot>,
@@ -279,17 +297,50 @@ impl AgentBridge {
     pub fn spawn_with(rt: Handle, cmd_spec: AgentCommand) -> Result<Self> {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BridgeEvent>();
         let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
-        let supervisor = rt.spawn(supervisor(cmd_spec.build(), submit_rx, events_tx.clone()));
+
+        // Drift log: open once for the bridge's lifetime and pass an Arc
+        // clone to each supervisor (current + each restart). Failure here
+        // is non-fatal — the bridge runs without persistent drift logging.
+        let drift_path = cmd_spec
+            .drift_log_path
+            .clone()
+            .unwrap_or_else(|| default_drift_log_path(&resolve_home()));
+        let drift_log = match DriftLog::open(&drift_path) {
+            Ok(log) => Some(Arc::new(log)),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %drift_path.display(),
+                    "agent_bridge: drift-log unavailable; unknown notifications will only be warn-logged"
+                );
+                None
+            }
+        };
+
+        let supervisor = rt.spawn(supervisor(
+            cmd_spec.build(),
+            submit_rx,
+            events_tx.clone(),
+            drift_log.clone(),
+        ));
         Ok(Self {
             cmd_spec,
             rt,
             events_tx,
             events_rx: std::sync::Mutex::new(Some(events_rx)),
+            drift_log,
             current: std::sync::Mutex::new(SupervisorSlot {
                 submit_tx,
                 _supervisor: supervisor,
             }),
         })
+    }
+
+    /// Borrow the drift log so callers (e.g. a diagnostic pane) can render
+    /// a `summary()` without owning the bridge's lifetime. Returns `None`
+    /// if the log file could not be opened at construction.
+    pub fn drift_log(&self) -> Option<&Arc<DriftLog>> {
+        self.drift_log.as_ref()
     }
 
     /// Send a user-typed prompt. Non-blocking; returns immediately.
@@ -351,6 +402,7 @@ impl AgentBridge {
             self.cmd_spec.build(),
             submit_rx,
             self.events_tx.clone(),
+            self.drift_log.clone(),
         ));
 
         // Replace atomically. Dropping the old `SupervisorSlot` here
@@ -384,6 +436,7 @@ async fn supervisor(
     mut cmd: Command,
     submit_rx: mpsc::UnboundedReceiver<String>,
     events_tx: mpsc::UnboundedSender<BridgeEvent>,
+    drift_log: Option<Arc<DriftLog>>,
 ) {
     let mut child: Child = match cmd.spawn() {
         Ok(c) => c,
@@ -499,6 +552,16 @@ async fn supervisor(
                     break;
                 };
                 let method = notification.method().to_string();
+
+                // PR-W: any notification the local registry didn't recognise
+                // gets appended to the drift log so the diagnostic pane can
+                // surface protocol drift without losing the payload.
+                if notification.is_unknown()
+                    && let Some(log) = drift_log.as_ref()
+                {
+                    log.record(&method, notification.params());
+                }
+
                 if method.starts_with("agent/")
                     && let Some(sink) = wal_sink.as_mut()
                 {
@@ -684,6 +747,62 @@ mod tests {
         assert!(
             result.is_err(),
             "WalSink::new must fail when home is a regular file"
+        );
+    }
+
+    /// PR-W: AgentBridge::spawn_with creates a usable DriftLog when a
+    /// writable path is provided. We don't actually run the supervisor here
+    /// — that requires a tokio runtime + a child binary — but we exercise
+    /// the constructor's drift-log open path and the public accessor.
+    #[test]
+    fn spawn_with_opens_drift_log_at_custom_path() {
+        // The constructor itself spawns a tokio task, so we need a runtime.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let tmp = TempDir::new().unwrap();
+        let drift_path = tmp.path().join("custom/drift.jsonl");
+
+        // Use a definitely-existing binary so the spawn doesn't fail with
+        // ENOENT before we get to inspect the drift log. /bin/cat is on
+        // every Linux test runner; it'll just sit waiting on stdin.
+        let bridge = AgentBridge::spawn_with(
+            rt.handle().clone(),
+            AgentCommand {
+                program: PathBuf::from("/bin/cat"),
+                arg0: "codex-agent".to_string(),
+                envs: Vec::new(),
+                drift_log_path: Some(drift_path.clone()),
+            },
+        )
+        .expect("spawn_with succeeds when /bin/cat is present");
+
+        let log = bridge.drift_log().expect("drift_log present");
+        log.record(
+            "test/sentinel",
+            &serde_json::json!({"hello": "from agent_bridge"}),
+        );
+        log.flush().expect("flush succeeds");
+
+        // The file is created and contains the recorded entry.
+        assert!(drift_path.exists(), "drift log file at {drift_path:?}");
+        let body = std::fs::read_to_string(&drift_path).expect("readable");
+        assert!(
+            body.contains("test/sentinel"),
+            "drift-log file missing record: {body:?}"
+        );
+
+        // Summary view round-trips the same data.
+        let summary = log.summary();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.io_errors, 0);
+        assert_eq!(
+            summary.by_method,
+            vec![("test/sentinel".to_string(), 1)],
         );
     }
 }

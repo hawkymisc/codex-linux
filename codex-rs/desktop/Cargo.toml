@@ -53,6 +53,7 @@ anyhow = { workspace = true }
 ciborium = "0.2"
 clap = { workspace = true, features = ["derive"] }
 codex-agent-backend = { path = "../agent-backend" }
+codex-drift-log = { path = "../drift-log" }
 codex-jsonrpc-framing = { path = "../jsonrpc-framing" }
 codex-markdown-ast = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["std"] }

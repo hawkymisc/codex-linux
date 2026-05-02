@@ -5,7 +5,7 @@ Linux-native Agentic IDE that wraps the Codex CLI agent (and, optionally,
 Claude Code) behind a libadwaita GUI. It is the convergent finalist plan
 from a 10-iteration design synthesis.
 
-> Status: **PR-A through PR-U + PR-S2 landed**. The IDE skeleton is now usable:
+> Status: **PR-A through PR-U + PR-S2 + PR-W landed**. The IDE skeleton is now usable:
 >
 > * `codex-desktop` (4.2 MB release binary, 1.4 MB headless) launches an
 >   AdwApplicationWindow with sidebar + GtkSourceView editor tabs +
@@ -41,9 +41,9 @@ from a 10-iteration design synthesis.
 > Quality: ~180 tests green, clippy zero warnings, real `rust-analyzer
 > 1.93.0` initialise round-trip green, AppImage runs out-of-the-box on
 > Ubuntu 22.04+ with libgtk-4-1 / libadwaita-1-0 / libgtksourceview-5-0.
-> See "Phased delivery" below for PR-V+ (in-process Codex via
-> codex-app-server-client, gettext, a11y CI gate, Flatpak vendoring for
-> Flathub, …).
+> See "Phased delivery" below for the remaining roadmap (in-process Codex
+> via codex-app-server-client, ClaudeBackend + full 10 conformance scenarios,
+> gettext / Weblate i18n, a11y CI gate, Flatpak vendoring for Flathub, …).
 
 ## 1. Goals & non-goals
 

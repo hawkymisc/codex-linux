@@ -34,6 +34,12 @@ fn test_command() -> Result<AgentCommand> {
         // tests/agent_bridge_smoke.rs.
         arg0: "codex-desktop".to_string(),
         envs: vec![("CODEX_DESKTOP_FORCE_ROLE".into(), "agent".into())],
+        // Per-test drift-log path so concurrent test runs don't share
+        // state under `~/.local/state/codex-desktop/`.
+        drift_log_path: Some(std::env::temp_dir().join(format!(
+            "codex-desktop-restart-test-{}-drift.jsonl",
+            std::process::id()
+        ))),
     })
 }
 
