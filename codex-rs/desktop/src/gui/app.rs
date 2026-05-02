@@ -299,8 +299,12 @@ impl MainWindow {
 
         // Install the agent-closed callback so the chat pane can ask us
         // to surface an `AdwToast` with a Reconnect action when
-        // `BridgeEvent::AgentClosed` fires.
+        // `BridgeEvent::AgentClosed` fires. PR-S2 wires the button to
+        // `AgentBridge::restart()` — the new supervisor reuses the same
+        // events channel, so subsequent `MessageDelta` notifications flip
+        // the pill back to Thinking automatically.
         let toast_overlay = self.toast_overlay.clone();
+        let reconnect_bridge = Rc::clone(&bridge);
         self.chat.set_agent_closed_callback(Box::new(move || {
             let toast = adw::Toast::builder()
                 .title("Codex agent disconnected")
@@ -308,12 +312,12 @@ impl MainWindow {
                 .timeout(0)
                 .priority(adw::ToastPriority::High)
                 .build();
-            // NOTE: real reconnect flow lands in PR-S2 — `AgentBridge`
-            // does not yet expose a `restart()` entry point. For v1 we
-            // log the request and dismiss the toast so the user knows
-            // the click was registered.
+            let restart_bridge = Rc::clone(&reconnect_bridge);
             toast.connect_button_clicked(move |t| {
-                tracing::info!("gui: reconnect requested (no-op until PR-S2)");
+                match restart_bridge.restart() {
+                    Ok(()) => tracing::info!("gui: agent restart kicked off"),
+                    Err(err) => tracing::warn!(error = %err, "gui: agent restart failed"),
+                }
                 t.dismiss();
             });
             toast_overlay.add_toast(toast);

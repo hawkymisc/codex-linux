@@ -37,7 +37,7 @@ use tokio::process::{Child, Command};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::wal::{RecordKind, TurnLog, WalConfig, WalManager};
 
@@ -183,22 +183,83 @@ fn resolve_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Recipe for spawning the agent child. Captured at construction time so
+/// [`AgentBridge::restart`] can rebuild the same `Command` after a crash
+/// without revisiting `current_exe()` (which can fail on systems where the
+/// binary has been moved or unlinked between launches).
+#[derive(Clone, Debug)]
+pub struct AgentCommand {
+    /// Absolute path to the binary to spawn.
+    pub program: PathBuf,
+    /// argv[0] to present to the child. The desktop binary multiplexes
+    /// roles on this, so PR-A's `codex-agent` role is selected by passing
+    /// `"codex-agent"` here.
+    pub arg0: String,
+    /// Optional env overrides applied on each spawn. Used by integration
+    /// tests to bake `CODEX_DESKTOP_FORCE_ROLE=agent` into the child env.
+    pub envs: Vec<(String, String)>,
+}
+
+impl AgentCommand {
+    /// Build the recipe used by the GUI: spawn the in-tree desktop binary
+    /// with argv[0] rewritten to `"codex-agent"`. Resolves `current_exe()`
+    /// at call time so it surfaces the I/O error immediately rather than
+    /// hiding it inside the supervisor task.
+    pub fn default_codex_agent() -> Result<Self> {
+        let program = std::env::current_exe()
+            .context("agent_bridge: cannot resolve current executable path")?;
+        Ok(Self {
+            program,
+            arg0: "codex-agent".to_string(),
+            envs: Vec::new(),
+        })
+    }
+
+    fn build(&self) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.arg0(&self.arg0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+}
+
+/// Mutable state replaced wholesale on each restart.
+struct SupervisorSlot {
+    /// Submit sink for the *current* supervisor. Dropping it closes the
+    /// supervisor's receiver, which terminates that supervisor's main loop
+    /// and (via `kill_on_drop`) the child.
+    submit_tx: mpsc::UnboundedSender<String>,
+    /// JoinHandle held for drop semantics. Dropping detaches; the task
+    /// exits naturally when its `submit_tx` is dropped (above) and the
+    /// child stdout EOFs.
+    _supervisor: JoinHandle<()>,
+}
+
 /// Handle held by the GUI side. Cheap to clone via [`std::rc::Rc`].
 pub struct AgentBridge {
-    /// Outbound channel for user prompts. Produces a [`Submission`] which
-    /// the submission task forwards to [`AgentBackend::submit`].
-    submit_tx: mpsc::UnboundedSender<String>,
+    /// Recipe used to spawn each child. Cloned on every restart.
+    cmd_spec: AgentCommand,
+    /// Tokio handle to spawn the supervisor task. Captured once at
+    /// construction so the GTK side never has to thread it through to
+    /// reconnect button callbacks.
+    rt: Handle,
+    /// Inbound event channel, shared across restarts: each new supervisor
+    /// gets its own clone of the sender so existing GUI subscribers
+    /// continue receiving without re-subscribing.
+    events_tx: mpsc::UnboundedSender<BridgeEvent>,
     /// One-shot extraction slot for the inbound event receiver. Wrapped in
     /// a [`std::sync::Mutex`] so [`Self::take_events_rx`] only takes the
     /// receiver once even if the bridge is shared.
     events_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BridgeEvent>>>,
-    /// Join handle for the notification-forwarding task.
-    ///
-    /// The leading underscore signals "owned for drop semantics" — when the
-    /// bridge is dropped the handle is dropped, which lets tokio reclaim
-    /// the task slot. The submission task is kept alive by the channel
-    /// receiver and shuts down on its own when [`Self::submit_tx`] drops.
-    _shutdown_handle: JoinHandle<()>,
+    /// Replaceable per-supervisor state. Locked briefly on `submit()` to
+    /// read the current `submit_tx`, and on `restart()` to swap.
+    current: std::sync::Mutex<SupervisorSlot>,
 }
 
 impl AgentBridge {
@@ -209,43 +270,41 @@ impl AgentBridge {
     /// own). The returned bridge is ready for [`Self::submit`] immediately;
     /// the initialize handshake runs concurrently in the background.
     pub fn spawn(rt: Handle) -> Result<Self> {
-        let exe = std::env::current_exe()
-            .context("agent_bridge: cannot resolve current executable path")?;
+        Self::spawn_with(rt, AgentCommand::default_codex_agent()?)
+    }
 
-        let mut cmd = Command::new(&exe);
-        // Set argv[0] to "codex-agent" so the role-detection logic in
-        // `main.rs` selects the agent role. `current_exe()` gives an
-        // absolute path which we keep as the `program` so the child
-        // continues to load the same binary; `arg0` only renames argv[0].
-        cmd.arg0("codex-agent")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-
-        let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
+    /// Like [`Self::spawn`] but with an explicit [`AgentCommand`] recipe.
+    /// Used by integration tests to bake test-only env vars
+    /// (`CODEX_DESKTOP_FORCE_ROLE=agent`) into the spawned child.
+    pub fn spawn_with(rt: Handle, cmd_spec: AgentCommand) -> Result<Self> {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BridgeEvent>();
-
-        // Spawn the supervisor task on the tokio runtime; it owns the
-        // child process and the backend instance for the lifetime of the
-        // bridge.
-        let supervisor = rt.spawn(supervisor(cmd, submit_rx, events_tx));
-
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
+        let supervisor = rt.spawn(supervisor(cmd_spec.build(), submit_rx, events_tx.clone()));
         Ok(Self {
-            submit_tx,
+            cmd_spec,
+            rt,
+            events_tx,
             events_rx: std::sync::Mutex::new(Some(events_rx)),
-            _shutdown_handle: supervisor,
+            current: std::sync::Mutex::new(SupervisorSlot {
+                submit_tx,
+                _supervisor: supervisor,
+            }),
         })
     }
 
     /// Send a user-typed prompt. Non-blocking; returns immediately.
     ///
-    /// If the bridge has already shut down (the supervisor task dropped
+    /// If the current supervisor has already shut down (the task dropped
     /// the receiver) the prompt is silently discarded after a `tracing`
-    /// warning. The UI will see the failure as an [`BridgeEvent::AgentClosed`]
-    /// event on the inbound stream.
+    /// warning. The UI will see the failure as a [`BridgeEvent::AgentClosed`]
+    /// event on the inbound stream and can call [`Self::restart`] to
+    /// recover.
     pub fn submit(&self, prompt: String) {
-        if let Err(err) = self.submit_tx.send(prompt) {
+        let result = match self.current.lock() {
+            Ok(slot) => slot.submit_tx.send(prompt),
+            Err(poisoned) => poisoned.into_inner().submit_tx.send(prompt),
+        };
+        if let Err(err) = result {
             warn!(
                 error = %err,
                 "agent_bridge: submit dropped — supervisor task is gone"
@@ -257,12 +316,60 @@ impl AgentBridge {
     /// calls.
     ///
     /// The caller owns the receiver and is expected to drain it from the
-    /// GTK main loop via `glib::MainContext::spawn_local`.
+    /// GTK main loop via `glib::MainContext::spawn_local`. The receiver
+    /// survives any number of [`Self::restart`] calls — each restart
+    /// hands the new supervisor a fresh `events_tx` clone but never
+    /// touches the existing receiver.
     pub fn take_events_rx(&self) -> Option<mpsc::UnboundedReceiver<BridgeEvent>> {
         match self.events_rx.lock() {
             Ok(mut g) => g.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         }
+    }
+
+    /// Restart the agent: spawn a fresh `codex-agent` child, replace the
+    /// current supervisor, and let the old one tear down. Existing
+    /// subscribers continue receiving events on the same channel.
+    ///
+    /// During the transition the old supervisor will emit one trailing
+    /// [`BridgeEvent::AgentClosed`] as its child dies; the GUI is expected
+    /// to treat any subsequent `MessageDelta`/`TurnCompleted` as
+    /// implicit reconnection (the status pill flips back to Thinking/Idle
+    /// on its own).
+    ///
+    /// Returns an error only if the I/O setup for the new child fails;
+    /// channel-related races between old-supervisor teardown and
+    /// new-supervisor startup are handled internally.
+    pub fn restart(&self) -> Result<()> {
+        info!(
+            program = %self.cmd_spec.program.display(),
+            arg0 = %self.cmd_spec.arg0,
+            "agent_bridge: restart requested"
+        );
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
+        let supervisor = self.rt.spawn(supervisor(
+            self.cmd_spec.build(),
+            submit_rx,
+            self.events_tx.clone(),
+        ));
+
+        // Replace atomically. Dropping the old `SupervisorSlot` here
+        // drops the old `submit_tx`, which closes the old supervisor's
+        // receiver; that supervisor exits its main loop and the
+        // `kill_on_drop` Child handle terminates the old grandchild.
+        let new_slot = SupervisorSlot {
+            submit_tx,
+            _supervisor: supervisor,
+        };
+        match self.current.lock() {
+            Ok(mut g) => {
+                *g = new_slot;
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = new_slot;
+            }
+        }
+        Ok(())
     }
 }
 
