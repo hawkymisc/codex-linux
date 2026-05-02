@@ -5,7 +5,7 @@ Linux-native Agentic IDE that wraps the Codex CLI agent (and, optionally,
 Claude Code) behind a libadwaita GUI. It is the convergent finalist plan
 from a 10-iteration design synthesis.
 
-> Status: **PR-A through PR-U + PR-S2 + PR-W landed**. The IDE skeleton is now usable:
+> Status: **PR-A through PR-U + PR-S2 + PR-W + PR-X landed**. The IDE skeleton is now usable:
 >
 > * `codex-desktop` (4.2 MB release binary, 1.4 MB headless) launches an
 >   AdwApplicationWindow with sidebar + GtkSourceView editor tabs +
@@ -36,6 +36,14 @@ from a 10-iteration design synthesis.
 >   `~/.local/state/codex-desktop/drift-log.jsonl` with per-method
 >   counters surfaced via `AgentBridge::drift_log()`. Backs the
 >   off-by-default Protocol Drift diagnostic pane (§3.3).
+> * Claude backend skeleton (`codex-claude-backend`): sibling
+>   `ClaudeBackend` adapter with `claude/*` wire methods + own
+>   `KnownVariantRegistry`, registered via `inventory::submit!` as
+>   `BackendId("claude-code")` so the desktop binary will list it in
+>   a backend picker. Default factory returns `BackendError::Closed`
+>   until a real `claude-code` host transport lands — pure NDJSON
+>   over stdio for testing today, ready to plug into the Anthropic
+>   Agent SDK transport when it's available.
 > * Distribution: 770 KB `.deb` (cargo-deb), 38 MB AppImage
 >   (linuxdeploy + linuxdeploy-plugin-gtk + appimagetool), Flatpak
 >   manifest targeting `org.gnome.Platform//46`.
@@ -48,11 +56,11 @@ from a 10-iteration design synthesis.
 >   in O(Δ); chat widgets refresh through `md_to_widgets::block_to_
 >   widget` so users see bold/code/lists growing in real time.
 >
-> Quality: ~200 tests green (PR-U +6, PR-S2 +1 integration, PR-W +10
-> across drift-log/agent-backend/agent-bridge), clippy zero warnings,
-> real `rust-analyzer 1.93.0` initialise round-trip green, AppImage
-> runs out-of-the-box on Ubuntu 22.04+ with libgtk-4-1 / libadwaita-1-0
-> / libgtksourceview-5-0.
+> Quality: ~210 tests green (PR-U +6, PR-S2 +1 integration, PR-W +10
+> across drift-log/agent-backend/agent-bridge, PR-X +10 in
+> claude-backend), clippy zero warnings, real `rust-analyzer 1.93.0`
+> initialise round-trip green, AppImage runs out-of-the-box on Ubuntu
+> 22.04+ with libgtk-4-1 / libadwaita-1-0 / libgtksourceview-5-0.
 > See "Phased delivery" below for the remaining roadmap (in-process Codex
 > via codex-app-server-client, ClaudeBackend + full 10 conformance scenarios,
 > gettext / Weblate i18n, a11y CI gate, Flatpak vendoring for Flathub, …).
@@ -323,10 +331,12 @@ the commit subject contains `[bench-regression-ack: <reason>]`.
 | `codex-desktop` | Desktop binary skeleton with arg0 multiplex; GTK behind feature flag |
 
 Subsequent PRs have shipped `codex-content-search` (PR-Q),
-`codex-agent-backend-conformance` (PR-B), and `codex-drift-log` (PR-W);
-`codex-lspd` lives inside `codex-desktop` as an arg0-multiplexed role
-rather than a sibling crate (PR-I/M/U). Still outstanding:
-`codex-claude-backend`, `codex-desktop-theme`, `codex-desktop-a11y`,
+`codex-agent-backend-conformance` (PR-B), `codex-drift-log` (PR-W), and
+`codex-claude-backend` (PR-X — skeleton with NDJSON adapter, default
+registry, and inventory registration; real `claude-code` host transport
+remains a future PR). `codex-lspd` lives inside `codex-desktop` as an
+arg0-multiplexed role rather than a sibling crate (PR-I/M/U). Still
+outstanding: `codex-desktop-theme`, `codex-desktop-a11y`,
 `codex-host-portal`.
 
 ## 12. Honest residual risks

@@ -2195,6 +2195,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-claude-backend"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "codex-agent-backend",
+ "codex-jsonrpc-framing",
+ "futures",
+ "inventory",
+ "pretty_assertions",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "codex-cli"
 version = "0.0.0"
 dependencies = [
