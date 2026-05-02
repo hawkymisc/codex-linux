@@ -22,8 +22,9 @@ In-tree Codex Desktop wrapper for Linux. GTK4 + libadwaita + GtkSourceView 5.
 | **PR-R** | ChatPane streaming path uses `IncrementalParser` per assistant block: bold / code / lists / tables grow in real time, not only on turn completion. `INC_PARSERS` thread-local keyed on `MessageBlock::as_ptr() as usize`; evicted on `finalise_assistant_block`. |
 | **PR-O+S** | 38 MB AppImage via three-phase build (linuxdeploy `--plugin gtk` → patch wrapper → `appimagetool`). `--appimage-extract-and-run` works without FUSE. Status pill in `AdwHeaderBar` (Idle / Thinking… / Awaiting / Disconnected) driven by `BridgeEvent`. `AdwToast` "Codex agent disconnected" with a Reconnect action button. |
 | **PR-T** | Flatpak manifest targeting `org.gnome.Platform//46` + `rust-stable//24.08` SDK extension, finish-args for portals + secrets + fcitx; `build-flatpak.sh` bootstrap. Vendored sources (flatpak-cargo-generator) deferred to PR-T2. |
+| **PR-U** | `codex-lspd` keeps spawned servers alive after `lsp/start`, registers them in `Supervisor` by `server_id`, and wires real `lsp/textDocumentDid{Open,Change,Close}` → LSP `textDocument/did{Open,Change,Close}` notification forwarding. Per-server pump task multiplexes `textDocument/publishDiagnostics` back to the parent NDJSON channel with `server_id` injected into params. Single mpsc-fed writer task on stdout serialises responses and notifications without frame interleaving. |
 
-See [`../../docs/desktop-architecture.md`](../../docs/desktop-architecture.md) for the full architecture and the remaining roadmap (real LSP didChange / publishDiagnostics forwarding, in-process Codex via codex-app-server-client, gettext, a11y CI gate).
+See [`../../docs/desktop-architecture.md`](../../docs/desktop-architecture.md) for the full architecture and the remaining roadmap (in-process Codex via codex-app-server-client, gettext, a11y CI gate).
 
 ## Build
 

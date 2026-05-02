@@ -5,7 +5,7 @@ Linux-native Agentic IDE that wraps the Codex CLI agent (and, optionally,
 Claude Code) behind a libadwaita GUI. It is the convergent finalist plan
 from a 10-iteration design synthesis.
 
-> Status: **PR-A through PR-T landed**. The IDE skeleton is now usable:
+> Status: **PR-A through PR-U landed**. The IDE skeleton is now usable:
 >
 > * `codex-desktop` (4.2 MB release binary, 1.4 MB headless) launches an
 >   AdwApplicationWindow with sidebar + GtkSourceView editor tabs +
@@ -15,6 +15,11 @@ from a 10-iteration design synthesis.
 >   streaming `agent/message_delta` + `agent/turn_completed`.
 > * `codex-lspd` role: NDJSON dispatch + LSP `Content-Length:` framing
 >   + opt-in real `rust-analyzer` spawn + initialize round-trip.
+>   PR-U keeps spawned servers alive (registered in `Supervisor` by
+>   `server_id`), forwards `lsp/textDocumentDid{Open,Change,Close}`
+>   to the LSP server as real `textDocument/did{Open,Change,Close}`
+>   notifications, and pumps `textDocument/publishDiagnostics` back
+>   to the parent NDJSON channel with `server_id` tagged in params.
 > * `AgentBridge` spawns the in-tree binary as a `codex-agent` child
 >   via `arg0`-multiplex, drives Send → submit → streaming reply →
 >   markdown rendering via `IncrementalParser`. Status pill flips
@@ -36,8 +41,9 @@ from a 10-iteration design synthesis.
 > Quality: ~180 tests green, clippy zero warnings, real `rust-analyzer
 > 1.93.0` initialise round-trip green, AppImage runs out-of-the-box on
 > Ubuntu 22.04+ with libgtk-4-1 / libadwaita-1-0 / libgtksourceview-5-0.
-> See "Phased delivery" below for PR-U+ (real LSP didChange/diagnostics
-> traffic, in-process Codex via codex-app-server-client, gettext, …).
+> See "Phased delivery" below for PR-V+ (in-process Codex via
+> codex-app-server-client, gettext, a11y CI gate, AgentBridge restart,
+> Flatpak vendoring for Flathub, …).
 
 ## 1. Goals & non-goals
 
