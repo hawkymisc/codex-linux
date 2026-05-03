@@ -1,0 +1,101 @@
+[package]
+name = "codex-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "codex-desktop"
+path = "src/main.rs"
+
+[lib]
+name = "codex_desktop"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables the actual GTK4 + libadwaita + GtkSourceView 5 GUI. OFF by default
+# so the workspace builds in environments without GTK development headers
+# (CI that lacks libgtk-4-dev / libadwaita-1-dev). The Linux distribution
+# packages (.deb, AppImage, Flatpak) all build with `--features gtk`.
+gtk = ["dep:gtk", "dep:adw", "dep:sourceview5", "dep:glib", "dep:ashpd"]
+
+[package.metadata.deb]
+name = "codex-desktop"
+maintainer = "OpenAI <opensource@openai.com>"
+copyright = "2026, OpenAI <opensource@openai.com>"
+license-file = ["../../LICENSE", "0"]
+extended-description = """
+Codex Desktop is a Linux-native, libadwaita-styled IDE that wraps the
+Codex CLI agent (and, optionally, Claude Code) behind a single GUI.
+See <https://github.com/openai/codex> for details."""
+section = "devel"
+priority = "optional"
+depends = "$auto, libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.4), libgtksourceview-5-0"
+features = ["gtk"]
+assets = [
+    ["target/release/codex-desktop",                                            "usr/bin/",                                                          "755"],
+    ["packaging/dev.codex.Desktop.desktop",                                     "usr/share/applications/",                                           "644"],
+    ["packaging/dev.codex.Desktop.metainfo.xml",                                "usr/share/metainfo/",                                               "644"],
+    ["packaging/icons/hicolor/scalable/apps/dev.codex.Desktop.svg",             "usr/share/icons/hicolor/scalable/apps/",                            "644"],
+    ["../../docs/desktop-architecture.md",                                      "usr/share/doc/codex-desktop/architecture.md",                       "644"],
+    ["README.md",                                                               "usr/share/doc/codex-desktop/README.md",                             "644"],
+    ["packaging/symlinks/codex-agent",                                          "usr/libexec/codex-desktop/",                                        "755"],
+    ["packaging/symlinks/codex-lspd",                                           "usr/libexec/codex-desktop/",                                        "755"],
+]
+maintainer-scripts = "packaging/debian"
+
+[dependencies]
+anyhow = { workspace = true }
+ciborium = "0.2"
+clap = { workspace = true, features = ["derive"] }
+codex-agent-backend = { path = "../agent-backend" }
+codex-drift-log = { path = "../drift-log" }
+codex-jsonrpc-framing = { path = "../jsonrpc-framing" }
+codex-markdown-ast = { workspace = true }
+futures = { workspace = true, default-features = false, features = ["std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+# GTK stack — optional, gated by the `gtk` feature.
+[dependencies.gtk]
+package = "gtk4"
+version = "0.9"
+optional = true
+features = ["v4_12"]
+
+[dependencies.adw]
+package = "libadwaita"
+version = "0.7"
+optional = true
+features = ["v1_5"]
+
+[dependencies.sourceview5]
+version = "0.9"
+optional = true
+features = ["v5_10"]
+
+[dependencies.glib]
+version = "0.20"
+optional = true
+
+# xdg-desktop-portal client (Settings interface for live theme follow-up).
+# Optional, only pulled in by the `gtk` feature since the portal is only
+# meaningful from inside the GUI process.
+[dependencies.ashpd]
+version = "0.9"
+optional = true
+default-features = false
+features = ["tokio"]
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+which = { workspace = true }

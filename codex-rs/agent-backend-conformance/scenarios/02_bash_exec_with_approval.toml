@@ -1,0 +1,20 @@
+schema_version = 1
+description = "ExecCommandRequest triggers approval dialog; command runs; stdout streamed into a tool-call block."
+tags = ["exec", "approval"]
+timeout_ms = 30000
+
+[input]
+prompt = "list files in /tmp"
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "exec/request_approval"
+respond_with = { decision = "approved" }
+
+[[expected_events]]
+method = "exec/output_delta"
+
+[[expected_events]]
+method = "turn/completed"

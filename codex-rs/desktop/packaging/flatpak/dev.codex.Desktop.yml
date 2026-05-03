@@ -1,0 +1,60 @@
+# Flatpak manifest for codex-desktop.
+#
+# Targets the GNOME 46 runtime, which ships GTK4 4.14, libadwaita 1.5 and
+# GtkSourceView 5 — the exact versions the `gtk` cargo feature is wired
+# against. The Rust toolchain comes from the freedesktop SDK extension
+# pinned to the matching 24.08 base.
+#
+# This is the first-cut PR-T manifest. Production builds should vendor
+# the cargo registry via `flatpak-cargo-generator.py` (see TODO below) so
+# the build can run with Flatpak's offline-only network policy. For now
+# we drop `--offline` from the cargo invocations and rely on
+# `flatpak-builder --share=network` (or the equivalent global default on
+# older flatpak-builder releases).
+id: dev.codex.Desktop
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable//24.08
+command: codex-desktop
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+  - --share=network
+  - --share=ipc
+  - "--talk-name=org.freedesktop.portal.*"
+  - --talk-name=org.freedesktop.secrets
+  - --socket=fcitx
+  - --env=GTK_IM_MODULE=fcitx
+  - --env=PATH=/app/bin:/usr/bin
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/codex-desktop/cargo
+modules:
+  - name: codex-desktop
+    buildsystem: simple
+    sources:
+      - type: dir
+        path: ../../../..
+    build-commands:
+      # TODO(v2): vendor cargo deps via flatpak-cargo-generator.py so we
+      # can pass `--offline` and drop the network requirement at build
+      # time. For PR-T's first cut we run online.
+      - cd codex-rs && cargo fetch
+      - cd codex-rs && cargo build --release -p codex-desktop --features gtk
+      - install -Dm755 codex-rs/target/release/codex-desktop /app/bin/codex-desktop
+      - install -Dm644 codex-rs/desktop/packaging/dev.codex.Desktop.desktop
+        /app/share/applications/dev.codex.Desktop.desktop
+      - install -Dm644 codex-rs/desktop/packaging/dev.codex.Desktop.metainfo.xml
+        /app/share/metainfo/dev.codex.Desktop.metainfo.xml
+      - install -Dm644 codex-rs/desktop/packaging/icons/hicolor/scalable/apps/dev.codex.Desktop.svg
+        /app/share/icons/hicolor/scalable/apps/dev.codex.Desktop.svg
+      # libexec shims for the arg0 multiplex (codex-agent / codex-lspd)
+      - install -Dm755 codex-rs/desktop/packaging/symlinks/codex-agent
+        /app/libexec/codex-desktop/codex-agent
+      - install -Dm755 codex-rs/desktop/packaging/symlinks/codex-lspd
+        /app/libexec/codex-desktop/codex-lspd

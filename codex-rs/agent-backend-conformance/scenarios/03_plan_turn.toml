@@ -1,0 +1,16 @@
+schema_version = 1
+description = "Multi-step Plan notification renders as checklist; step completion updates checkbox state without rerendering siblings."
+tags = ["plan"]
+timeout_ms = 30000
+
+[input]
+prompt = "make a 3-step plan to ship the desktop"
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "plan/updated"
+
+[[expected_events]]
+method = "turn/completed"

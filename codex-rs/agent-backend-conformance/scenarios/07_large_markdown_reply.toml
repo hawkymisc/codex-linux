@@ -1,0 +1,16 @@
+schema_version = 1
+description = "A 250 KB markdown reply with code, tables and a 2k-row list streams without dropping below 55 fps on UHD 620."
+tags = ["streaming", "markdown", "performance"]
+timeout_ms = 60000
+
+[input]
+prompt = "describe Linux syscalls in great detail with code examples"
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "agent/message_delta"
+
+[[expected_events]]
+method = "turn/completed"

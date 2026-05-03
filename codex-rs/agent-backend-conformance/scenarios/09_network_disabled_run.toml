@@ -1,0 +1,18 @@
+schema_version = 1
+description = "Full chat → exec → file-edit cycle on offline policy; only sandboxed local tool calls succeed; no DNS calls observed (verified externally via strace)."
+tags = ["network", "sandbox"]
+timeout_ms = 30000
+
+[input]
+prompt = "compile and run main.rs"
+network_disabled = true
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "exec/request_approval"
+respond_with = { decision = "approved" }
+
+[[expected_events]]
+method = "turn/completed"

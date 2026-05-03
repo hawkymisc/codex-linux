@@ -22,4 +22,8 @@ pub async fn run_app(cmd: AppCommand) -> anyhow::Result<()> {
     {
         crate::desktop_app::run_app_open_or_install(workspace, cmd.download_url_override).await
     }
+    #[cfg(target_os = "linux")]
+    {
+        crate::desktop_app::run_app_open_or_install(workspace, cmd.download_url_override).await
+    }
 }

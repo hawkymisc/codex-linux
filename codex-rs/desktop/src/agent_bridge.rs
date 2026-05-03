@@ -1,0 +1,808 @@
+//! Bridge between the GTK main thread and a tokio runtime that drives a
+//! [`CodexBackend`] over a child `codex-agent` process.
+//!
+//! The bridge owns three actors:
+//!
+//! 1. A submission task that drains an mpsc channel and forwards each user
+//!    prompt as an [`AgentBackend::submit`] call.
+//! 2. A notification task that subscribes to [`CodexBackend::events`] and
+//!    classifies each notification into a [`BridgeEvent`] for the UI.
+//! 3. The child `codex-agent` process itself, spawned via `tokio::process`.
+//!
+//! The GTK side never touches `tokio` directly — it just calls
+//! [`AgentBridge::submit`] (non-blocking) and drains the receiver returned
+//! by [`AgentBridge::take_events_rx`] from `glib::MainContext::spawn_local`.
+//!
+//! # Why this lives in a separate module
+//!
+//! Wiring up an `Arc<dyn AgentBackend>` directly in the GUI module would
+//! force every `gui::*` file to depend on tokio types that have nothing
+//! to do with widget construction. Keeping all the runtime plumbing here
+//! lets `gui::app` stay thin and lets future PRs replace the in-tree child
+//! process with an in-process backend without touching widget code.
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use codex_agent_backend::{
+    AgentBackend, ClientInfo, CodexBackend, IncomingServerNotification, InitializeParams,
+    Submission, SubmissionId, ThreadId,
+};
+use codex_drift_log::DriftLog;
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::Arc;
+use tokio::process::{Child, Command};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, warn};
+
+use crate::wal::{RecordKind, TurnLog, WalConfig, WalManager};
+
+/// Default thread id used by [`AgentBridge`] until the protocol exposes a
+/// real per-conversation thread id. Mirrors the value used in submissions.
+const DEFAULT_THREAD_ID: &str = "default";
+
+/// Events surfaced by the bridge to the GTK side.
+///
+/// The variants intentionally mirror the agent-role's notification
+/// methods so the UI never has to peek at JSON. New variants will be added
+/// as the agent role grows; consumers should treat unknown notifications
+/// as a soft signal and continue running.
+#[derive(Debug, Clone)]
+pub enum BridgeEvent {
+    /// A streamed `agent/message_delta` chunk.
+    MessageDelta { text: String },
+    /// The `agent/turn_completed` terminal notification.
+    TurnCompleted { stop_reason: String },
+    /// The agent process exited (or its event stream closed).
+    AgentClosed,
+}
+
+/// CBOR payload appended for each user-submitted prompt.
+///
+/// The wal module treats record payloads as opaque bytes, so we wrap our
+/// per-kind structures in tiny `Serialize`/`Deserialize` types that the
+/// replay path (or future migration tooling) can decode directly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WalUserOp {
+    prompt: String,
+    ts_unix_ms: u128,
+}
+
+/// CBOR payload for one server notification we want to durably log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WalNotif {
+    method: String,
+    /// JSON-encoded notification params. Stored as a string rather than a
+    /// nested CBOR value so replay tooling can re-serialise to JSON without
+    /// re-introducing a `serde_json::Value` schema dependency.
+    params_json: String,
+    ts_unix_ms: u128,
+}
+
+/// Single-owner wrapper around a [`WalManager`] and the currently-open
+/// [`TurnLog`] (if any). Lives inside the supervisor task so all WAL writes
+/// happen from one thread; sync `std::fs` is fine because the only fsync
+/// call is on durability boundaries (TurnCompleted / ApprovalDecision).
+struct WalSink {
+    manager: WalManager,
+    current: Option<TurnLog>,
+    thread_id: String,
+}
+
+impl WalSink {
+    /// Construct a sink rooted at `home` (which becomes
+    /// `<home>/.local/state/codex-desktop/turns/`). Runs `WalManager::gc()`
+    /// once on construction to lazily prune anything past retention or
+    /// quota.
+    fn new(home: PathBuf, thread_id: String) -> Result<Self> {
+        let cfg = WalConfig::defaults_under(&home);
+        // Ensure the root directory exists so the gc + first open_turn
+        // succeed cleanly on a brand-new install. This also turns a
+        // fundamentally bad `home` (e.g. a regular file) into an early
+        // error rather than letting it surface on the first user submit.
+        std::fs::create_dir_all(&cfg.root)
+            .with_context(|| format!("create WAL root {}", cfg.root.display()))?;
+        let manager = WalManager::new(cfg);
+        if let Err(err) = manager.gc() {
+            warn!(error = %err, "agent_bridge: WAL gc failed on startup");
+        }
+        Ok(Self {
+            manager,
+            current: None,
+            thread_id,
+        })
+    }
+
+    /// Append a `UserOp` record. Opens a fresh [`TurnLog`] if none is open.
+    fn record_user_op(&mut self, turn_id: &str, prompt: &str) -> Result<()> {
+        let log = self.ensure_open(turn_id)?;
+        let payload = WalUserOp {
+            prompt: prompt.to_owned(),
+            ts_unix_ms: now_unix_ms(),
+        };
+        log.append(RecordKind::UserOp, &payload)
+    }
+
+    /// Append a `ServerNotification` record. Opens a fresh [`TurnLog`] if
+    /// none is open.
+    fn record_notification(
+        &mut self,
+        turn_id: &str,
+        method: &str,
+        params_json: &str,
+    ) -> Result<()> {
+        let log = self.ensure_open(turn_id)?;
+        let payload = WalNotif {
+            method: method.to_owned(),
+            params_json: params_json.to_owned(),
+            ts_unix_ms: now_unix_ms(),
+        };
+        log.append(RecordKind::ServerNotification, &payload)
+    }
+
+    /// Mark the current turn complete: rename `<turn>.wal` to
+    /// `<turn>.wal.done`. Idempotent — returns Ok if no turn is open.
+    fn complete_turn(&mut self) -> Result<()> {
+        match self.current.take() {
+            None => Ok(()),
+            Some(log) => log.complete().map(|_| ()),
+        }
+    }
+
+    fn ensure_open(&mut self, turn_id: &str) -> Result<&mut TurnLog> {
+        // `Option::get_or_insert_with` doesn't compose with a fallible
+        // factory, so we open up-front and assign. `Option::insert` returns
+        // a `&mut T` directly, side-stepping the `expect()` lint.
+        match self.current {
+            Some(ref mut log) => Ok(log),
+            None => {
+                let log = self.manager.open_turn(&self.thread_id, turn_id)?;
+                Ok(self.current.insert(log))
+            }
+        }
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Resolve the user's home directory for WAL storage. Honours `$HOME`
+/// when set, falling back to the current dir if not — the supervisor
+/// will surface any write errors as warnings without crashing the bridge.
+fn resolve_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Default drift-log JSONL path under the user's state dir. Mirrors the
+/// `~/.local/state/codex-desktop/turns/...` layout used by the WAL so a
+/// future "diagnostic export" UI can grab both with one path prefix.
+fn default_drift_log_path(home: &std::path::Path) -> PathBuf {
+    home.join(".local/state/codex-desktop/drift-log.jsonl")
+}
+
+/// Recipe for spawning the agent child. Captured at construction time so
+/// [`AgentBridge::restart`] can rebuild the same `Command` after a crash
+/// without revisiting `current_exe()` (which can fail on systems where the
+/// binary has been moved or unlinked between launches).
+#[derive(Clone, Debug)]
+pub struct AgentCommand {
+    /// Absolute path to the binary to spawn.
+    pub program: PathBuf,
+    /// argv[0] to present to the child. The desktop binary multiplexes
+    /// roles on this, so PR-A's `codex-agent` role is selected by passing
+    /// `"codex-agent"` here.
+    pub arg0: String,
+    /// Optional env overrides applied on each spawn. Used by integration
+    /// tests to bake `CODEX_DESKTOP_FORCE_ROLE=agent` into the child env.
+    pub envs: Vec<(String, String)>,
+    /// Override the drift-log JSONL path. Tests point this at a tempdir
+    /// so unrelated test runs don't share state under `~/.local/state/`.
+    /// `None` defaults to [`default_drift_log_path`].
+    pub drift_log_path: Option<PathBuf>,
+}
+
+impl AgentCommand {
+    /// Build the recipe used by the GUI: spawn the in-tree desktop binary
+    /// with argv[0] rewritten to `"codex-agent"`. Resolves `current_exe()`
+    /// at call time so it surfaces the I/O error immediately rather than
+    /// hiding it inside the supervisor task.
+    pub fn default_codex_agent() -> Result<Self> {
+        let program = std::env::current_exe()
+            .context("agent_bridge: cannot resolve current executable path")?;
+        Ok(Self {
+            program,
+            arg0: "codex-agent".to_string(),
+            envs: Vec::new(),
+            drift_log_path: None,
+        })
+    }
+
+    fn build(&self) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.arg0(&self.arg0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+}
+
+/// Mutable state replaced wholesale on each restart.
+struct SupervisorSlot {
+    /// Submit sink for the *current* supervisor. Dropping it closes the
+    /// supervisor's receiver, which terminates that supervisor's main loop
+    /// and (via `kill_on_drop`) the child.
+    submit_tx: mpsc::UnboundedSender<String>,
+    /// JoinHandle held for drop semantics. Dropping detaches; the task
+    /// exits naturally when its `submit_tx` is dropped (above) and the
+    /// child stdout EOFs.
+    _supervisor: JoinHandle<()>,
+}
+
+/// Handle held by the GUI side. Cheap to clone via [`std::rc::Rc`].
+pub struct AgentBridge {
+    /// Recipe used to spawn each child. Cloned on every restart.
+    cmd_spec: AgentCommand,
+    /// Tokio handle to spawn the supervisor task. Captured once at
+    /// construction so the GTK side never has to thread it through to
+    /// reconnect button callbacks.
+    rt: Handle,
+    /// Inbound event channel, shared across restarts: each new supervisor
+    /// gets its own clone of the sender so existing GUI subscribers
+    /// continue receiving without re-subscribing.
+    events_tx: mpsc::UnboundedSender<BridgeEvent>,
+    /// One-shot extraction slot for the inbound event receiver. Wrapped in
+    /// a [`std::sync::Mutex`] so [`Self::take_events_rx`] only takes the
+    /// receiver once even if the bridge is shared.
+    events_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BridgeEvent>>>,
+    /// Drift log shared across restarts. `None` if the file at
+    /// `cmd_spec.drift_log_path` (or the default path) could not be
+    /// opened — the bridge falls back to logging unknowns at warn level.
+    drift_log: Option<Arc<DriftLog>>,
+    /// Replaceable per-supervisor state. Locked briefly on `submit()` to
+    /// read the current `submit_tx`, and on `restart()` to swap.
+    current: std::sync::Mutex<SupervisorSlot>,
+}
+
+impl AgentBridge {
+    /// Spawn the in-tree `codex-agent` child and start listening for events.
+    ///
+    /// All async work is spawned onto `rt`, so this constructor is safe to
+    /// call from the GTK main thread (which has no tokio runtime of its
+    /// own). The returned bridge is ready for [`Self::submit`] immediately;
+    /// the initialize handshake runs concurrently in the background.
+    pub fn spawn(rt: Handle) -> Result<Self> {
+        Self::spawn_with(rt, AgentCommand::default_codex_agent()?)
+    }
+
+    /// Like [`Self::spawn`] but with an explicit [`AgentCommand`] recipe.
+    /// Used by integration tests to bake test-only env vars
+    /// (`CODEX_DESKTOP_FORCE_ROLE=agent`) into the spawned child.
+    pub fn spawn_with(rt: Handle, cmd_spec: AgentCommand) -> Result<Self> {
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
+
+        // Drift log: open once for the bridge's lifetime and pass an Arc
+        // clone to each supervisor (current + each restart). Failure here
+        // is non-fatal — the bridge runs without persistent drift logging.
+        let drift_path = cmd_spec
+            .drift_log_path
+            .clone()
+            .unwrap_or_else(|| default_drift_log_path(&resolve_home()));
+        let drift_log = match DriftLog::open(&drift_path) {
+            Ok(log) => Some(Arc::new(log)),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %drift_path.display(),
+                    "agent_bridge: drift-log unavailable; unknown notifications will only be warn-logged"
+                );
+                None
+            }
+        };
+
+        let supervisor = rt.spawn(supervisor(
+            cmd_spec.build(),
+            submit_rx,
+            events_tx.clone(),
+            drift_log.clone(),
+        ));
+        Ok(Self {
+            cmd_spec,
+            rt,
+            events_tx,
+            events_rx: std::sync::Mutex::new(Some(events_rx)),
+            drift_log,
+            current: std::sync::Mutex::new(SupervisorSlot {
+                submit_tx,
+                _supervisor: supervisor,
+            }),
+        })
+    }
+
+    /// Borrow the drift log so callers (e.g. a diagnostic pane) can render
+    /// a `summary()` without owning the bridge's lifetime. Returns `None`
+    /// if the log file could not be opened at construction.
+    pub fn drift_log(&self) -> Option<&Arc<DriftLog>> {
+        self.drift_log.as_ref()
+    }
+
+    /// Send a user-typed prompt. Non-blocking; returns immediately.
+    ///
+    /// If the current supervisor has already shut down (the task dropped
+    /// the receiver) the prompt is silently discarded after a `tracing`
+    /// warning. The UI will see the failure as a [`BridgeEvent::AgentClosed`]
+    /// event on the inbound stream and can call [`Self::restart`] to
+    /// recover.
+    pub fn submit(&self, prompt: String) {
+        let result = match self.current.lock() {
+            Ok(slot) => slot.submit_tx.send(prompt),
+            Err(poisoned) => poisoned.into_inner().submit_tx.send(prompt),
+        };
+        if let Err(err) = result {
+            warn!(
+                error = %err,
+                "agent_bridge: submit dropped — supervisor task is gone"
+            );
+        }
+    }
+
+    /// Take the inbound event receiver. Returns [`None`] on subsequent
+    /// calls.
+    ///
+    /// The caller owns the receiver and is expected to drain it from the
+    /// GTK main loop via `glib::MainContext::spawn_local`. The receiver
+    /// survives any number of [`Self::restart`] calls — each restart
+    /// hands the new supervisor a fresh `events_tx` clone but never
+    /// touches the existing receiver.
+    pub fn take_events_rx(&self) -> Option<mpsc::UnboundedReceiver<BridgeEvent>> {
+        match self.events_rx.lock() {
+            Ok(mut g) => g.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+
+    /// Restart the agent: spawn a fresh `codex-agent` child, replace the
+    /// current supervisor, and let the old one tear down. Existing
+    /// subscribers continue receiving events on the same channel.
+    ///
+    /// During the transition the old supervisor will emit one trailing
+    /// [`BridgeEvent::AgentClosed`] as its child dies; the GUI is expected
+    /// to treat any subsequent `MessageDelta`/`TurnCompleted` as
+    /// implicit reconnection (the status pill flips back to Thinking/Idle
+    /// on its own).
+    ///
+    /// Returns an error only if the I/O setup for the new child fails;
+    /// channel-related races between old-supervisor teardown and
+    /// new-supervisor startup are handled internally.
+    pub fn restart(&self) -> Result<()> {
+        info!(
+            program = %self.cmd_spec.program.display(),
+            arg0 = %self.cmd_spec.arg0,
+            "agent_bridge: restart requested"
+        );
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel::<String>();
+        let supervisor = self.rt.spawn(supervisor(
+            self.cmd_spec.build(),
+            submit_rx,
+            self.events_tx.clone(),
+            self.drift_log.clone(),
+        ));
+
+        // Replace atomically. Dropping the old `SupervisorSlot` here
+        // drops the old `submit_tx`, which closes the old supervisor's
+        // receiver; that supervisor exits its main loop and the
+        // `kill_on_drop` Child handle terminates the old grandchild.
+        let new_slot = SupervisorSlot {
+            submit_tx,
+            _supervisor: supervisor,
+        };
+        match self.current.lock() {
+            Ok(mut g) => {
+                *g = new_slot;
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = new_slot;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run the bridge supervisor: spawn the child, drive the backend, and pump
+/// notifications into the UI channel until either side closes.
+///
+/// This function is the bridge's hot path. It owns the `CodexBackend` for
+/// its entire lifetime and exits cleanly when the user-prompt channel is
+/// closed (e.g. the GUI dropped the bridge) or when the child stdout
+/// reaches EOF (the agent process exited).
+async fn supervisor(
+    mut cmd: Command,
+    submit_rx: mpsc::UnboundedReceiver<String>,
+    events_tx: mpsc::UnboundedSender<BridgeEvent>,
+    drift_log: Option<Arc<DriftLog>>,
+) {
+    let mut child: Child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            error!(error = %err, "agent_bridge: failed to spawn codex-agent child");
+            let _ = events_tx.send(BridgeEvent::AgentClosed);
+            return;
+        }
+    };
+
+    let stdin = match child.stdin.take() {
+        Some(s) => s,
+        None => {
+            error!("agent_bridge: child has no stdin pipe");
+            let _ = events_tx.send(BridgeEvent::AgentClosed);
+            return;
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            error!("agent_bridge: child has no stdout pipe");
+            let _ = events_tx.send(BridgeEvent::AgentClosed);
+            return;
+        }
+    };
+
+    let mut backend = CodexBackend::from_async_pipe(stdout, stdin);
+
+    // Send `initialize` immediately. Failure here is non-fatal for the UI;
+    // we surface it as a warning and let the user discover the broken
+    // backend through the AgentClosed event we send below if the child
+    // crashes outright.
+    let init = InitializeParams {
+        client_info: ClientInfo {
+            name: "codex-desktop".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        protocol_version: None,
+        supported_methods: Vec::new(),
+    };
+    if let Err(err) = backend.initialize(init).await {
+        warn!(error = %err, "agent_bridge: initialize failed");
+    }
+
+    // Subscribe to backend notifications BEFORE we start pumping submits
+    // so we don't race the first message_delta. The notification stream
+    // outlives the submission stream by design — even after the user
+    // stops sending, the agent may still emit trailing notifications.
+    let mut events = backend.events();
+
+    let backend = std::sync::Arc::new(backend);
+
+    // Construct the WAL sink in the supervisor task. Failure to set up
+    // the WAL is non-fatal: we log a warning and run without durable
+    // logging rather than refusing to start the bridge.
+    let mut wal_sink: Option<WalSink> = match WalSink::new(resolve_home(), DEFAULT_THREAD_ID.into()) {
+        Ok(s) => Some(s),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "agent_bridge: WAL sink unavailable; turns will not be durably logged"
+            );
+            None
+        }
+    };
+
+    // Track the most-recent submit id so we can route notifications to
+    // the right per-turn WAL file. Until the protocol exposes a real turn
+    // id we synthesise one from the submit counter (`s{n}`), which is the
+    // same id we sent on the wire.
+    let mut current_turn_id: Option<String> = None;
+    let mut submit_counter: u64 = 0;
+
+    // Drive submissions and notifications from a single task — this keeps
+    // `WalSink` single-owner (sync `std::fs` is fine) and avoids any
+    // cross-task locking on the hot path.
+    let mut submit_rx = submit_rx;
+    loop {
+        tokio::select! {
+            // User prompt -> WAL UserOp record + backend submission.
+            maybe_prompt = submit_rx.recv() => {
+                let Some(prompt) = maybe_prompt else {
+                    // GUI dropped the bridge; stop pumping. We still want
+                    // to drain any pending notifications so we exit the
+                    // outer loop and let the agent_closed branch fire on
+                    // child EOF below.
+                    break;
+                };
+                submit_counter += 1;
+                let submission_id = format!("s{submit_counter}");
+                if let Some(sink) = wal_sink.as_mut()
+                    && let Err(err) = sink.record_user_op(&submission_id, &prompt)
+                {
+                    warn!(error = %err, "agent_bridge: WAL record_user_op failed");
+                }
+                current_turn_id = Some(submission_id.clone());
+                let submission = Submission {
+                    id: SubmissionId::from(submission_id),
+                    thread_id: ThreadId::from(DEFAULT_THREAD_ID),
+                    payload: json!({ "text": prompt }),
+                };
+                if let Err(err) = backend.submit(submission).await {
+                    warn!(error = %err, "agent_bridge: submit failed");
+                    let _ = events_tx.send(BridgeEvent::AgentClosed);
+                    break;
+                }
+            }
+            // Server notification -> WAL ServerNotification + UI event.
+            maybe_notif = events.next() => {
+                let Some(notification) = maybe_notif else {
+                    // Backend stream closed (child EOF or receiver dropped).
+                    break;
+                };
+                let method = notification.method().to_string();
+
+                // PR-W: any notification the local registry didn't recognise
+                // gets appended to the drift log so the diagnostic pane can
+                // surface protocol drift without losing the payload.
+                if notification.is_unknown()
+                    && let Some(log) = drift_log.as_ref()
+                {
+                    log.record(&method, notification.params());
+                }
+
+                if method.starts_with("agent/")
+                    && let Some(sink) = wal_sink.as_mut()
+                {
+                    // The latest user submission's id is the closest
+                    // approximation of a turn id. If we haven't seen
+                    // a submit yet, fall back to a sentinel so the
+                    // notification still lands on disk somewhere
+                    // recoverable.
+                    let turn_id = current_turn_id.as_deref().unwrap_or("preboot");
+                    let params_json = serde_json::to_string(notification.params())
+                        .unwrap_or_else(|_| "null".to_string());
+                    if let Err(err) = sink.record_notification(turn_id, &method, &params_json) {
+                        warn!(error = %err, "agent_bridge: WAL record_notification failed");
+                    }
+                }
+                let is_turn_complete = method == "agent/turn_completed";
+                if let Some(event) = classify_notification(&notification) {
+                    if events_tx.send(event).is_err() {
+                        debug!("agent_bridge: UI receiver dropped, stopping pump");
+                        break;
+                    }
+                } else {
+                    debug!(
+                        method = %notification.method(),
+                        "agent_bridge: ignoring unmapped notification"
+                    );
+                }
+                if is_turn_complete {
+                    if let Some(sink) = wal_sink.as_mut()
+                        && let Err(err) = sink.complete_turn()
+                    {
+                        warn!(error = %err, "agent_bridge: WAL complete_turn failed");
+                    }
+                    current_turn_id = None;
+                }
+            }
+        }
+    }
+
+    // Stream ended — either EOF on the child or the receiver was dropped.
+    // Tell the UI and let everything wind down. Any in-flight turn is
+    // left as `<turn>.wal` (no `.done` rename); replay tooling treats
+    // that as crash recovery.
+    let _ = events_tx.send(BridgeEvent::AgentClosed);
+    let _ = child.wait().await;
+}
+
+/// Classify a backend notification into a [`BridgeEvent`].
+///
+/// Returns [`None`] for notifications the UI does not currently surface;
+/// the supervisor logs those at debug level rather than dropping them
+/// silently so protocol drift is at least observable.
+fn classify_notification(notification: &IncomingServerNotification) -> Option<BridgeEvent> {
+    match notification.method() {
+        "agent/message_delta" => {
+            let text = notification
+                .params()
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(BridgeEvent::MessageDelta { text })
+        }
+        "agent/turn_completed" => {
+            let stop_reason = notification
+                .params()
+                .get("stop_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            Some(BridgeEvent::TurnCompleted { stop_reason })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use codex_agent_backend::UnknownNotification;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn classify_message_delta() {
+        let n = IncomingServerNotification::Unknown(UnknownNotification {
+            method: "agent/message_delta".into(),
+            params: json!({"delta": "hello"}),
+        });
+        match classify_notification(&n) {
+            Some(BridgeEvent::MessageDelta { text }) => assert_eq!(text, "hello"),
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_turn_completed() {
+        let n = IncomingServerNotification::Unknown(UnknownNotification {
+            method: "agent/turn_completed".into(),
+            params: json!({"stop_reason": "end_turn"}),
+        });
+        match classify_notification(&n) {
+            Some(BridgeEvent::TurnCompleted { stop_reason }) => {
+                assert_eq!(stop_reason, "end_turn");
+            }
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_unknown_method_returns_none() {
+        let n = IncomingServerNotification::Unknown(UnknownNotification {
+            method: "agent/something_new".into(),
+            params: json!({}),
+        });
+        assert!(classify_notification(&n).is_none());
+    }
+
+    #[test]
+    fn message_delta_missing_field_yields_empty_string() {
+        let n = IncomingServerNotification::Unknown(UnknownNotification {
+            method: "agent/message_delta".into(),
+            params: json!({}),
+        });
+        match classify_notification(&n) {
+            Some(BridgeEvent::MessageDelta { text }) => assert_eq!(text, ""),
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wal_sink_records_user_op_and_notification() {
+        use crate::wal::replay;
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().to_path_buf();
+        let mut sink = WalSink::new(home.clone(), "th-test".into())
+            .expect("WalSink::new succeeds in writable tempdir");
+
+        sink.record_user_op("s1", "hello world")
+            .expect("record_user_op succeeds");
+        sink.record_notification("s1", "agent/message_delta", "{\"delta\":\"hi\"}")
+            .expect("record_notification succeeds");
+        sink.complete_turn().expect("complete_turn succeeds");
+
+        let done_path = home
+            .join(".local/state/codex-desktop/turns")
+            .join("th-test")
+            .join("s1.wal.done");
+        assert!(done_path.exists(), "expected {} to exist", done_path.display());
+
+        let records = replay(&done_path).expect("replay succeeds");
+        assert_eq!(records.len(), 2, "expected 2 records, got {}", records.len());
+        assert_eq!(records[0].kind, RecordKind::UserOp);
+        assert_eq!(records[1].kind, RecordKind::ServerNotification);
+
+        // Verify the payloads round-trip via CBOR.
+        let user_op: WalUserOp = ciborium::de::from_reader(records[0].payload.as_slice())
+            .expect("decode WalUserOp");
+        assert_eq!(user_op.prompt, "hello world");
+        let notif: WalNotif = ciborium::de::from_reader(records[1].payload.as_slice())
+            .expect("decode WalNotif");
+        assert_eq!(notif.method, "agent/message_delta");
+        assert_eq!(notif.params_json, "{\"delta\":\"hi\"}");
+
+        // complete_turn is idempotent — calling again is a no-op.
+        sink.complete_turn()
+            .expect("second complete_turn returns Ok with no open log");
+    }
+
+    #[test]
+    fn wal_sink_handles_failed_directory_gracefully() {
+        // Pass a regular file as `home`. WalSink::new tries to create
+        // `<home>/.local/state/codex-desktop/turns/`, which must fail since
+        // the parent path component is a non-directory.
+        let tmp = TempDir::new().unwrap();
+        let bogus_home = tmp.path().join("not-a-directory");
+        std::fs::write(&bogus_home, b"i am a file, not a dir").unwrap();
+
+        let result = WalSink::new(bogus_home, "th-test".into());
+        assert!(
+            result.is_err(),
+            "WalSink::new must fail when home is a regular file"
+        );
+    }
+
+    /// PR-W: AgentBridge::spawn_with creates a usable DriftLog when a
+    /// writable path is provided. We don't actually run the supervisor here
+    /// — that requires a tokio runtime + a child binary — but we exercise
+    /// the constructor's drift-log open path and the public accessor.
+    #[test]
+    fn spawn_with_opens_drift_log_at_custom_path() {
+        // The constructor itself spawns a tokio task, so we need a runtime.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let tmp = TempDir::new().unwrap();
+        let drift_path = tmp.path().join("custom/drift.jsonl");
+
+        // Use a definitely-existing binary so the spawn doesn't fail with
+        // ENOENT before we get to inspect the drift log. /bin/cat is on
+        // every Linux test runner; it'll just sit waiting on stdin.
+        let bridge = AgentBridge::spawn_with(
+            rt.handle().clone(),
+            AgentCommand {
+                program: PathBuf::from("/bin/cat"),
+                arg0: "codex-agent".to_string(),
+                envs: Vec::new(),
+                drift_log_path: Some(drift_path.clone()),
+            },
+        )
+        .expect("spawn_with succeeds when /bin/cat is present");
+
+        let log = bridge.drift_log().expect("drift_log present");
+        log.record(
+            "test/sentinel",
+            &serde_json::json!({"hello": "from agent_bridge"}),
+        );
+        log.flush().expect("flush succeeds");
+
+        // The file is created and contains the recorded entry.
+        assert!(drift_path.exists(), "drift log file at {drift_path:?}");
+        let body = std::fs::read_to_string(&drift_path).expect("readable");
+        assert!(
+            body.contains("test/sentinel"),
+            "drift-log file missing record: {body:?}"
+        );
+
+        // Summary view round-trips the same data.
+        let summary = log.summary();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.io_errors, 0);
+        assert_eq!(
+            summary.by_method,
+            vec![("test/sentinel".to_string(), 1)],
+        );
+    }
+}

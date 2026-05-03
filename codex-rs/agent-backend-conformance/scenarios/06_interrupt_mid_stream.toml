@@ -1,0 +1,16 @@
+schema_version = 1
+description = "Esc during a streamed reply emits Op::Interrupt; agent acknowledges with TurnAborted within 500 ms."
+tags = ["interrupt"]
+timeout_ms = 30000
+
+[input]
+prompt = "tell me a long story"
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "agent/message_delta"
+
+[[expected_events]]
+method = "turn/aborted"

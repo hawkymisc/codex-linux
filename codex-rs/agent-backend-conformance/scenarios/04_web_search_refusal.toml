@@ -1,0 +1,17 @@
+schema_version = 1
+description = "Agent requests a web fetch on a network_disabled=true policy; UI surfaces a typed refusal."
+tags = ["network", "refusal"]
+timeout_ms = 30000
+
+[input]
+prompt = "what's the latest GTK4 stable version?"
+network_disabled = true
+
+[[expected_events]]
+method = "thread/started"
+
+[[expected_events]]
+method = "agent/refused_network"
+
+[[expected_events]]
+method = "turn/completed"

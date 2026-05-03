@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.codex.Desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>Codex Desktop</name>
+  <summary>Linux-native Agentic IDE wrapping the Codex CLI agent</summary>
+  <description>
+    <p>
+      Codex Desktop is a Linux-native, libadwaita-styled IDE that wraps the
+      Codex CLI agent (and, optionally, Claude Code) behind a single GUI.
+      The window is a GtkSourceView editor split with a virtualised chat
+      pane that streams agent replies; a 3-process architecture
+      (codex-desktop / codex-agent / codex-lspd) keeps editor crashes
+      isolated from agent crashes.
+    </p>
+    <p>This release ships:</p>
+    <ul>
+      <li>AdwApplicationWindow with collapsible sidebar, AdwTabView editor, GtkColumnView chat.</li>
+      <li>AgentBridge spawning the in-tree codex-agent over NDJSON JSON-RPC.</li>
+      <li>Append-only write-ahead log of agent events for crash recovery.</li>
+      <li>Markdown rendering of assistant replies via pulldown-cmark and Pango (no embedded webview).</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">dev.codex.Desktop.desktop</launchable>
+  <url type="homepage">https://github.com/openai/codex</url>
+  <url type="bugtracker">https://github.com/openai/codex/issues</url>
+  <developer id="com.openai">
+    <name>OpenAI</name>
+  </developer>
+  <provides>
+    <binary>codex-desktop</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>IDE</category>
+    <category>TextEditor</category>
+  </categories>
+  <keywords>
+    <keyword>ai</keyword>
+    <keyword>agent</keyword>
+    <keyword>coding</keyword>
+    <keyword>llm</keyword>
+  </keywords>
+  <recommends>
+    <display_length compare="ge">768</display_length>
+    <internet>offline-only</internet>
+  </recommends>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.0.0" date="2026-04-29" type="development">
+      <description>
+        <p>Pre-release scaffolding: PR-A through PR-E. Not yet packaged for distribution.</p>
+      </description>
+    </release>
+  </releases>
+</component>

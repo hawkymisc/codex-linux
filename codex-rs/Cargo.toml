@@ -2,6 +2,8 @@
 members = [
     "aws-auth",
     "analytics",
+    "agent-backend",
+    "agent-backend-conformance",
     "agent-identity",
     "backend-client",
     "ansi-escape",
@@ -22,11 +24,15 @@ members = [
     "cloud-tasks",
     "cloud-tasks-client",
     "cloud-tasks-mock-client",
+    "claude-backend",
     "cli",
     "collaboration-mode-templates",
     "connectors",
     "config",
+    "content-search",
+    "desktop",
     "device-key",
+    "drift-log",
     "shell-command",
     "shell-escalation",
     "skills",
@@ -40,11 +46,13 @@ members = [
     "exec-server",
     "execpolicy",
     "execpolicy-legacy",
+    "jsonrpc-framing",
     "keyring-store",
     "file-search",
     "linux-sandbox",
     "lmstudio",
     "login",
+    "markdown-ast",
     "codex-mcp",
     "mcp-server",
     "memories/read",
@@ -115,6 +123,8 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Internal
 app_test_support = { path = "app-server/tests/common" }
+codex-agent-backend = { path = "agent-backend" }
+codex-agent-backend-conformance = { path = "agent-backend-conformance" }
 codex-analytics = { path = "analytics" }
 codex-agent-identity = { path = "agent-identity" }
 codex-ansi-escape = { path = "ansi-escape" }
@@ -129,6 +139,7 @@ codex-arg0 = { path = "arg0" }
 codex-async-utils = { path = "async-utils" }
 codex-backend-client = { path = "backend-client" }
 codex-chatgpt = { path = "chatgpt" }
+codex-claude-backend = { path = "claude-backend" }
 codex-cli = { path = "cli" }
 codex-client = { path = "codex-client" }
 codex-collaboration-mode-templates = { path = "collaboration-mode-templates" }
@@ -138,10 +149,13 @@ codex-cloud-tasks-mock-client = { path = "cloud-tasks-mock-client" }
 codex-code-mode = { path = "code-mode" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
+codex-content-search = { path = "content-search" }
 codex-core = { path = "core" }
 codex-core-plugins = { path = "core-plugins" }
 codex-core-skills = { path = "core-skills" }
+codex-desktop = { path = "desktop" }
 codex-device-key = { path = "device-key" }
+codex-drift-log = { path = "drift-log" }
 codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
 codex-exec-server = { path = "exec-server" }
@@ -150,6 +164,7 @@ codex-experimental-api-macros = { path = "codex-experimental-api-macros" }
 codex-features = { path = "features" }
 codex-feedback = { path = "feedback" }
 codex-install-context = { path = "install-context" }
+codex-jsonrpc-framing = { path = "jsonrpc-framing" }
 codex-file-search = { path = "file-search" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
@@ -157,6 +172,7 @@ codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
+codex-markdown-ast = { path = "markdown-ast" }
 codex-memories-read = { path = "memories/read" }
 codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }
@@ -395,6 +411,7 @@ which = "8"
 whoami = "1.6.1"
 wildmatch = "2.6.1"
 winapi-util = "0.1.11"
+xxhash-rust = "0.8"
 zip = "2.4.2"
 zstd = "0.13"
 
